@@ -17,9 +17,12 @@ edition.workspace = true
 embedded-storage.workspace = true
 thiserror.workspace = true
 log.workspace = true
+byte.workspace = true
+heapless.workspace = true
 zigbee = { path = "../zigbee" }
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+zigbee-cluster-library = { path = "../zigbee-cluster-library" }
 
 [dev-dependencies]
 mockall.workspace = true
