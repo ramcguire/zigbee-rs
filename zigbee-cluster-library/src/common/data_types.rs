@@ -69,7 +69,7 @@ fn write_int(bytes: &mut [u8], value: i64, len: usize) -> Result<usize, byte::Er
     Ok(len)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ZclDataType<'a> {
     NoData,
     Data(DataN),
@@ -177,7 +177,7 @@ impl TryWrite<u8> for ZclDataType<'_> {
 }
 
 /// 2.6.2.2 General Data
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataN {
     Data8(u8),
     Data16(u16),
@@ -255,7 +255,7 @@ impl TryWrite<u8> for DataN {
 }
 
 /// 2.6.2.4 Bitmap
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitmapN {
     Bitmap8(u8),
     Bitmap16(u16),
@@ -333,7 +333,7 @@ impl TryWrite<u8> for BitmapN {
 }
 
 /// 2.6.2.5 Unsigned Integer
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsignedN {
     Uint8(u8),
     Uint16(u16),
@@ -411,7 +411,7 @@ impl TryWrite<u8> for UnsignedN {
 }
 
 /// 2.6.2.6 Signed Integer
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignedN {
     Int8(i8),
     Int16(i16),
@@ -488,7 +488,7 @@ impl TryWrite<u8> for SignedN {
 }
 
 /// 2.6.2.7 Enumeration
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnumN {
     Enum8(u8),
     Enum16(u16),
@@ -528,7 +528,7 @@ impl TryWrite<u8> for EnumN {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FloatN {
     /// 2.6.2.8 Semi-precision based on IEEE-754
     Semi(u16),
@@ -576,7 +576,7 @@ impl TryWrite<u8> for FloatN {
 }
 
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZclString<'a> {
     /// 2.6.2.12 Octet String
     OctetString(&'a [u8]),
@@ -731,7 +731,7 @@ impl TryWrite<u8> for ZclString<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeType {
     /// 2.6.2.19 Time of day
     TimeOfDay(u32),
@@ -778,7 +778,7 @@ impl TryWrite<u8> for TimeType {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdentifierType {
     /// 2.6.2.22 Cluster ID
     ClusterId(u16),
@@ -826,7 +826,7 @@ impl TryWrite<u8> for IdentifierType {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MiscType<'a> {
     /// 2.6.2.25 IEEE Address
     IeeeAddress(u64),

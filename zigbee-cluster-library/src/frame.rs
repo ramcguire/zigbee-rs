@@ -8,20 +8,775 @@ use byte::ctx;
 use heapless::Vec;
 use zigbee_macros::impl_byte;
 
+use crate::cluster_server::DispatchContext;
 use crate::common::data_types::ZclDataType;
 use crate::header::ZclHeader;
-use crate::payload::ZclFramePayload;
+use crate::header::command_identifier::CommandIdentifier;
+use crate::header::frame_control::FrameType;
+use crate::header::manufacturer_code::ManufacturerCode;
+use crate::payload::WriteAttributesPayload;
+use crate::types::descriptors::AttrInfo;
+use crate::types::error::ZclError;
+use crate::types::ids::AttributeId;
+use crate::types::ids::CommandId;
 
-impl_byte! {
-    /// ZCL Frame
-    ///
-    /// See Section 2.4.1
-    #[derive(Debug, PartialEq)]
-    pub struct ZclFrame<'a> {
-        pub header: ZclHeader,
-        #[ctx = &header]
-        #[ctx_write = ()]
-        pub payload: ZclFramePayload<'a>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    ClientToServer,
+    ServerToClient,
+}
+
+impl Direction {
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::ClientToServer => Self::ServerToClient,
+            Self::ServerToClient => Self::ClientToServer,
+        }
+    }
+
+    pub const fn from_wire_bit(bit: bool) -> Self {
+        if bit {
+            Self::ServerToClient
+        } else {
+            Self::ClientToServer
+        }
+    }
+
+    pub const fn wire_bit(self) -> bool {
+        matches!(self, Self::ServerToClient)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RawCommandId(u8);
+
+impl RawCommandId {
+    pub const fn new(raw: u8) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    pub const fn known_global(self) -> Option<CommandIdentifier> {
+        match CommandIdentifier::from_bits(self.0) {
+            CommandIdentifier::Reserved(_) => None,
+            known => Some(known),
+        }
+    }
+
+    pub const fn cluster_specific(self) -> CommandId {
+        CommandId::new(self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZclFrameMeta {
+    pub manufacturer_code: Option<ManufacturerCode>,
+    pub sequence_number: u8,
+    pub direction: Direction,
+    pub disable_default_response: bool,
+}
+
+impl ZclFrameMeta {
+    pub const fn new(sequence_number: u8, direction: Direction) -> Self {
+        Self {
+            manufacturer_code: None,
+            sequence_number,
+            direction,
+            disable_default_response: false,
+        }
+    }
+
+    pub const fn with_manufacturer_code(mut self, code: ManufacturerCode) -> Self {
+        self.manufacturer_code = Some(code);
+        self
+    }
+
+    pub const fn disable_default_response(mut self) -> Self {
+        self.disable_default_response = true;
+        self
+    }
+
+    pub const fn enable_default_response(mut self) -> Self {
+        self.disable_default_response = false;
+        self
+    }
+
+    pub const fn response_to(request: &IncomingZclFrame<'_>) -> Self {
+        Self {
+            manufacturer_code: request.manufacturer_code(),
+            sequence_number: request.sequence_number(),
+            direction: request.direction().opposite(),
+            disable_default_response: true,
+        }
+    }
+
+    fn from_header(header: ZclHeader) -> Self {
+        Self {
+            manufacturer_code: header.manufacturer_code,
+            sequence_number: header.sequence_number,
+            direction: Direction::from_wire_bit(header.frame_control.direction()),
+            disable_default_response: header.frame_control.disable_default_response(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ZclFrameParts<C> {
+    meta: ZclFrameMeta,
+    command: C,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncomingZclFrame<'a> {
+    parts: ZclFrameParts<IncomingZclCommand<'a>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutgoingZclFrame<'a> {
+    parts: ZclFrameParts<OutgoingZclCommand<'a>>,
+}
+
+pub type ReadAttributes = Vec<ReadAttribute, 16>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum IncomingZclCommand<'a> {
+    Global(IncomingGlobalCommand<'a>),
+    ClusterSpecific {
+        command_id: CommandId,
+        data: &'a [u8],
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum IncomingGlobalCommand<'a> {
+    ReadAttributes(ReadAttributes),
+    WriteAttributes(WriteAttributesPayload<'a>),
+    WriteAttributesUndivided(WriteAttributesPayload<'a>),
+    WriteAttributesNoResponse(WriteAttributesPayload<'a>),
+    DiscoverAttributes {
+        start_attr: AttributeId,
+        max_count: u8,
+    },
+    DefaultResponse(DefaultResponse),
+    KnownUnhandled {
+        command_id: CommandIdentifier,
+        data: &'a [u8],
+    },
+    Unknown {
+        command_id: RawCommandId,
+        data: &'a [u8],
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum OutgoingZclCommand<'a> {
+    Global(OutgoingGlobalCommand<'a>),
+    ClusterSpecific {
+        command_id: CommandId,
+        data: &'a [u8],
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum OutgoingGlobalCommand<'a> {
+    ReadAttributesResponse(&'a [ReadAttributeResponse<'a>]),
+    WriteAttributesResponse(&'a [WriteAttributeStatus]),
+    ReportAttributes(&'a [AttributeReport<'a>]),
+    DefaultResponse(DefaultResponse),
+    DiscoverAttributesResponse(DiscoverAttributesResponse<'a>),
+    UnknownRaw {
+        command_id: RawCommandId,
+        data: &'a [u8],
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiscoverAttributesResponse<'a> {
+    pub discovery_complete: bool,
+    pub attributes: &'a [AttrInfo],
+}
+
+impl<'a> IncomingZclFrame<'a> {
+    pub fn decode(bytes: &'a [u8]) -> Result<(Self, usize), ZclError> {
+        let (header, header_len) = ZclHeader::try_read(bytes, ()).map_err(byte_to_zcl_error)?;
+        let meta = ZclFrameMeta::from_header(header);
+        let payload = &bytes[header_len..];
+
+        let (command, payload_len) = match header.frame_control.frame_type() {
+            FrameType::GlobalCommand => decode_incoming_global(header.command_identifier, payload)?,
+            FrameType::ClusterCommand => (
+                IncomingZclCommand::ClusterSpecific {
+                    command_id: CommandId::new(header.command_identifier.raw()),
+                    data: payload,
+                },
+                payload.len(),
+            ),
+            FrameType::Reserved => return Err(ZclError::InvalidValue),
+        };
+
+        Ok((
+            Self {
+                parts: ZclFrameParts { meta, command },
+            },
+            header_len + payload_len,
+        ))
+    }
+
+    pub const fn meta(&self) -> ZclFrameMeta {
+        self.parts.meta
+    }
+
+    pub const fn command(&self) -> &IncomingZclCommand<'a> {
+        &self.parts.command
+    }
+
+    pub const fn manufacturer_code(&self) -> Option<ManufacturerCode> {
+        self.parts.meta.manufacturer_code
+    }
+
+    pub const fn sequence_number(&self) -> u8 {
+        self.parts.meta.sequence_number
+    }
+
+    pub const fn direction(&self) -> Direction {
+        self.parts.meta.direction
+    }
+
+    pub const fn disable_default_response(&self) -> bool {
+        self.parts.meta.disable_default_response
+    }
+
+    pub const fn is_global(&self) -> bool {
+        matches!(self.parts.command, IncomingZclCommand::Global(_))
+    }
+
+    pub const fn is_cluster_specific(&self) -> bool {
+        matches!(
+            self.parts.command,
+            IncomingZclCommand::ClusterSpecific { .. }
+        )
+    }
+
+    pub const fn command_id(&self) -> RawCommandId {
+        match &self.parts.command {
+            IncomingZclCommand::Global(command) => RawCommandId::new(command.raw_id()),
+            IncomingZclCommand::ClusterSpecific { command_id, .. } => {
+                RawCommandId::new(command_id.0)
+            }
+        }
+    }
+
+    pub const fn global_command_id(&self) -> Option<CommandIdentifier> {
+        match &self.parts.command {
+            IncomingZclCommand::Global(command) => command.command_identifier(),
+            IncomingZclCommand::ClusterSpecific { .. } => None,
+        }
+    }
+
+    pub const fn cluster_command_id(&self) -> Option<CommandId> {
+        match &self.parts.command {
+            IncomingZclCommand::Global(_) => None,
+            IncomingZclCommand::ClusterSpecific { command_id, .. } => Some(*command_id),
+        }
+    }
+
+    pub fn should_send_default_response(&self, ctx: DispatchContext, status: Status) -> bool {
+        crate::cluster_server::should_send_default_response(self, ctx, status)
+    }
+
+    pub fn default_response(&self, status: Status) -> Option<OutgoingZclFrame<'static>> {
+        OutgoingZclFrame::default_response(self, status)
+    }
+}
+
+impl<'a> TryRead<'a, ()> for IncomingZclFrame<'a> {
+    fn try_read(bytes: &'a [u8], _: ()) -> byte::Result<(Self, usize)> {
+        Self::decode(bytes).map_err(zcl_to_byte_error)
+    }
+}
+
+impl IncomingGlobalCommand<'_> {
+    const fn raw_id(&self) -> u8 {
+        match self {
+            Self::ReadAttributes(_) => 0x00,
+            Self::WriteAttributes(_) => 0x02,
+            Self::WriteAttributesUndivided(_) => 0x03,
+            Self::WriteAttributesNoResponse(_) => 0x05,
+            Self::DefaultResponse(_) => 0x0b,
+            Self::DiscoverAttributes { .. } => 0x0c,
+            Self::KnownUnhandled { command_id, .. } => command_id.raw(),
+            Self::Unknown { command_id, .. } => command_id.raw(),
+        }
+    }
+
+    const fn command_identifier(&self) -> Option<CommandIdentifier> {
+        match self {
+            Self::ReadAttributes(_) => Some(CommandIdentifier::ReadAttributes),
+            Self::WriteAttributes(_) => Some(CommandIdentifier::WriteAttributes),
+            Self::WriteAttributesUndivided(_) => Some(CommandIdentifier::WriteAttributesUndivided),
+            Self::WriteAttributesNoResponse(_) => {
+                Some(CommandIdentifier::WriteAttributesNoResponse)
+            }
+            Self::DefaultResponse(_) => Some(CommandIdentifier::DefaultResponse),
+            Self::DiscoverAttributes { .. } => Some(CommandIdentifier::DiscoverAttributes),
+            Self::KnownUnhandled { command_id, .. } => Some(*command_id),
+            Self::Unknown { .. } => None,
+        }
+    }
+}
+
+impl<'a> OutgoingZclFrame<'a> {
+    pub const fn new(meta: ZclFrameMeta, command: OutgoingZclCommand<'a>) -> Self {
+        Self {
+            parts: ZclFrameParts { meta, command },
+        }
+    }
+
+    pub const fn global(meta: ZclFrameMeta, command: OutgoingGlobalCommand<'a>) -> Self {
+        Self::new(meta, OutgoingZclCommand::Global(command))
+    }
+
+    pub const fn cluster_specific(
+        meta: ZclFrameMeta,
+        command_id: CommandId,
+        data: &'a [u8],
+    ) -> Self {
+        Self::new(
+            meta,
+            OutgoingZclCommand::ClusterSpecific { command_id, data },
+        )
+    }
+
+    pub fn reply_to(request: &IncomingZclFrame<'_>, command: OutgoingZclCommand<'a>) -> Self {
+        Self::new(ZclFrameMeta::response_to(request), command)
+    }
+
+    pub fn default_response(request: &IncomingZclFrame<'_>, status: Status) -> Option<Self> {
+        if matches!(
+            request.command(),
+            IncomingZclCommand::Global(IncomingGlobalCommand::DefaultResponse(_))
+                | IncomingZclCommand::Global(IncomingGlobalCommand::WriteAttributesNoResponse(_))
+        ) {
+            return None;
+        }
+
+        Some(Self::reply_to(
+            request,
+            OutgoingZclCommand::Global(OutgoingGlobalCommand::DefaultResponse(DefaultResponse {
+                command_identifier: request.command_id().raw(),
+                status,
+            })),
+        ))
+    }
+
+    pub const fn meta(&self) -> ZclFrameMeta {
+        self.parts.meta
+    }
+
+    pub const fn command(&self) -> &OutgoingZclCommand<'a> {
+        &self.parts.command
+    }
+
+    pub const fn manufacturer_code(&self) -> Option<ManufacturerCode> {
+        self.parts.meta.manufacturer_code
+    }
+
+    pub const fn sequence_number(&self) -> u8 {
+        self.parts.meta.sequence_number
+    }
+
+    pub const fn direction(&self) -> Direction {
+        self.parts.meta.direction
+    }
+
+    pub const fn disable_default_response(&self) -> bool {
+        self.parts.meta.disable_default_response
+    }
+
+    pub const fn is_global(&self) -> bool {
+        matches!(self.parts.command, OutgoingZclCommand::Global(_))
+    }
+
+    pub const fn is_cluster_specific(&self) -> bool {
+        matches!(
+            self.parts.command,
+            OutgoingZclCommand::ClusterSpecific { .. }
+        )
+    }
+
+    pub const fn command_id(&self) -> RawCommandId {
+        RawCommandId::new(self.parts.command.command_byte())
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        frame_header_len(self.manufacturer_code()) + self.parts.command.payload_len()
+    }
+
+    pub fn encode(&self, buf: &mut [u8]) -> Result<usize, ZclError> {
+        let header_len = write_frame_header(
+            buf,
+            self.parts.command.frame_type(),
+            self.meta(),
+            self.parts.command.command_byte(),
+        )?;
+        let payload_len = self.parts.command.write_payload(&mut buf[header_len..])?;
+        Ok(header_len + payload_len)
+    }
+}
+
+impl OutgoingZclCommand<'_> {
+    const fn frame_type(&self) -> FrameType {
+        match self {
+            Self::Global(_) => FrameType::GlobalCommand,
+            Self::ClusterSpecific { .. } => FrameType::ClusterCommand,
+        }
+    }
+
+    const fn command_byte(&self) -> u8 {
+        match self {
+            Self::Global(command) => command.command_byte(),
+            Self::ClusterSpecific { command_id, .. } => command_id.0,
+        }
+    }
+
+    fn payload_len(&self) -> usize {
+        match self {
+            Self::Global(command) => command.payload_len(),
+            Self::ClusterSpecific { data, .. } => data.len(),
+        }
+    }
+
+    fn write_payload(&self, buf: &mut [u8]) -> Result<usize, ZclError> {
+        match self {
+            Self::Global(command) => command.write_payload(buf),
+            Self::ClusterSpecific { data, .. } => copy_payload(buf, data),
+        }
+    }
+}
+
+impl OutgoingGlobalCommand<'_> {
+    const fn command_byte(&self) -> u8 {
+        match self {
+            Self::ReadAttributesResponse(_) => 0x01,
+            Self::WriteAttributesResponse(_) => 0x04,
+            Self::ReportAttributes(_) => 0x0a,
+            Self::DefaultResponse(_) => 0x0b,
+            Self::DiscoverAttributesResponse(_) => 0x0d,
+            Self::UnknownRaw { command_id, .. } => command_id.raw(),
+        }
+    }
+
+    fn payload_len(&self) -> usize {
+        match self {
+            Self::ReadAttributesResponse(records) => {
+                records.iter().map(read_attribute_response_len).sum()
+            }
+            Self::WriteAttributesResponse(records) => write_attributes_response_len(records),
+            Self::ReportAttributes(records) => records.iter().map(attribute_report_len).sum(),
+            Self::DefaultResponse(_) => 2,
+            Self::DiscoverAttributesResponse(response) => 1 + response.attributes.len() * 3,
+            Self::UnknownRaw { data, .. } => data.len(),
+        }
+    }
+
+    fn write_payload(&self, buf: &mut [u8]) -> Result<usize, ZclError> {
+        let offset = &mut 0;
+        match self {
+            Self::ReadAttributesResponse(records) => {
+                for record in *records {
+                    write_read_attribute_response(buf, offset, record)?;
+                }
+            }
+            Self::WriteAttributesResponse(records) => {
+                write_normalized_attribute_statuses(buf, offset, records)?;
+            }
+            Self::ReportAttributes(records) => {
+                for record in *records {
+                    write_attribute_report(buf, offset, record)?;
+                }
+            }
+            Self::DefaultResponse(response) => {
+                write_byte_payload(buf, offset, response.command_identifier)?;
+                write_byte_payload(buf, offset, response.status as u8)?;
+            }
+            Self::DiscoverAttributesResponse(response) => {
+                write_byte_payload(buf, offset, u8::from(response.discovery_complete))?;
+                for attr in response.attributes {
+                    write_u16_payload(buf, offset, attr.id.0)?;
+                    write_byte_payload(buf, offset, attr.type_id.as_u8())?;
+                }
+            }
+            Self::UnknownRaw { data, .. } => {
+                *offset = copy_payload(buf, data)?;
+            }
+        }
+        Ok(*offset)
+    }
+}
+
+fn decode_incoming_global<'a>(
+    command_identifier: CommandIdentifier,
+    bytes: &'a [u8],
+) -> Result<(IncomingZclCommand<'a>, usize), ZclError> {
+    let offset = &mut 0;
+    let global = match command_identifier {
+        CommandIdentifier::ReadAttributes => {
+            let mut attrs = Vec::new();
+            while *offset < bytes.len() {
+                let attr = bytes.read_with(offset, ()).map_err(byte_to_zcl_error)?;
+                attrs.push(attr).map_err(|_| ZclError::BufferTooSmall)?;
+            }
+            IncomingGlobalCommand::ReadAttributes(attrs)
+        }
+        CommandIdentifier::WriteAttributes => {
+            *offset = bytes.len();
+            IncomingGlobalCommand::WriteAttributes(WriteAttributesPayload(bytes))
+        }
+        CommandIdentifier::WriteAttributesUndivided => {
+            *offset = bytes.len();
+            IncomingGlobalCommand::WriteAttributesUndivided(WriteAttributesPayload(bytes))
+        }
+        CommandIdentifier::WriteAttributesNoResponse => {
+            *offset = bytes.len();
+            IncomingGlobalCommand::WriteAttributesNoResponse(WriteAttributesPayload(bytes))
+        }
+        CommandIdentifier::DiscoverAttributes => {
+            if bytes.len() < 3 {
+                return Err(ZclError::InsufficientBytes);
+            }
+            *offset = 3;
+            IncomingGlobalCommand::DiscoverAttributes {
+                start_attr: AttributeId::new(u16::from_le_bytes([bytes[0], bytes[1]])),
+                max_count: bytes[2],
+            }
+        }
+        CommandIdentifier::DefaultResponse => IncomingGlobalCommand::DefaultResponse(
+            bytes.read_with(offset, ()).map_err(byte_to_zcl_error)?,
+        ),
+        CommandIdentifier::Reserved(raw) => {
+            *offset = bytes.len();
+            IncomingGlobalCommand::Unknown {
+                command_id: RawCommandId::new(raw),
+                data: bytes,
+            }
+        }
+        known => {
+            *offset = bytes.len();
+            IncomingGlobalCommand::KnownUnhandled {
+                command_id: known,
+                data: bytes,
+            }
+        }
+    };
+
+    Ok((IncomingZclCommand::Global(global), *offset))
+}
+
+fn frame_header_len(manufacturer_code: Option<ManufacturerCode>) -> usize {
+    3 + if manufacturer_code.is_some() { 2 } else { 0 }
+}
+
+fn write_frame_header(
+    buf: &mut [u8],
+    frame_type: FrameType,
+    meta: ZclFrameMeta,
+    command_id: u8,
+) -> Result<usize, ZclError> {
+    let needed = frame_header_len(meta.manufacturer_code);
+    if buf.len() < needed {
+        return Err(ZclError::BufferTooSmall);
+    }
+
+    let frame_type_bits = match frame_type {
+        FrameType::GlobalCommand => 0x00,
+        FrameType::ClusterCommand => 0x01,
+        FrameType::Reserved => return Err(ZclError::InvalidValue),
+    };
+    let manufacturer_bit = if meta.manufacturer_code.is_some() {
+        0x04
+    } else {
+        0x00
+    };
+    let direction_bit = if meta.direction.wire_bit() {
+        0x08
+    } else {
+        0x00
+    };
+    let disable_default_response_bit = if meta.disable_default_response {
+        0x10
+    } else {
+        0x00
+    };
+
+    let mut n = 0;
+    buf[n] = frame_type_bits | manufacturer_bit | direction_bit | disable_default_response_bit;
+    n += 1;
+    if let Some(manufacturer_code) = meta.manufacturer_code {
+        buf[n..n + 2].copy_from_slice(&manufacturer_code.0.to_le_bytes());
+        n += 2;
+    }
+    buf[n] = meta.sequence_number;
+    n += 1;
+    buf[n] = command_id;
+    n += 1;
+    Ok(n)
+}
+
+fn copy_payload(buf: &mut [u8], data: &[u8]) -> Result<usize, ZclError> {
+    buf.get_mut(..data.len())
+        .ok_or(ZclError::BufferTooSmall)?
+        .copy_from_slice(data);
+    Ok(data.len())
+}
+
+fn write_byte_payload(buf: &mut [u8], offset: &mut usize, value: u8) -> Result<(), ZclError> {
+    *buf.get_mut(*offset).ok_or(ZclError::BufferTooSmall)? = value;
+    *offset += 1;
+    Ok(())
+}
+
+fn write_u16_payload(buf: &mut [u8], offset: &mut usize, value: u16) -> Result<(), ZclError> {
+    buf.get_mut(*offset..*offset + 2)
+        .ok_or(ZclError::BufferTooSmall)?
+        .copy_from_slice(&value.to_le_bytes());
+    *offset += 2;
+    Ok(())
+}
+
+fn write_zcl_data_type(
+    buf: &mut [u8],
+    offset: &mut usize,
+    value: ZclDataType<'_>,
+) -> Result<(), ZclError> {
+    let type_id = value.type_id().map_err(byte_to_zcl_error)?;
+    write_byte_payload(buf, offset, type_id)?;
+    let written = value
+        .try_write(
+            buf.get_mut(*offset..).ok_or(ZclError::BufferTooSmall)?,
+            type_id,
+        )
+        .map_err(byte_to_zcl_error)?;
+    *offset += written;
+    Ok(())
+}
+
+fn write_read_attribute_response(
+    buf: &mut [u8],
+    offset: &mut usize,
+    record: &ReadAttributeResponse<'_>,
+) -> Result<(), ZclError> {
+    write_u16_payload(buf, offset, record.attribute_id)?;
+    write_byte_payload(buf, offset, record.status as u8)?;
+    match (record.status, record.value) {
+        (Status::Success, Some(value)) => write_zcl_data_type(buf, offset, value),
+        (Status::Success, None) => Err(ZclError::InvalidValue),
+        (_, None) => Ok(()),
+        (_, Some(_)) => Err(ZclError::InvalidValue),
+    }
+}
+
+fn write_attribute_report(
+    buf: &mut [u8],
+    offset: &mut usize,
+    record: &AttributeReport<'_>,
+) -> Result<(), ZclError> {
+    write_u16_payload(buf, offset, record.attribute_id)?;
+    write_zcl_data_type(buf, offset, record.value)
+}
+
+fn write_normalized_attribute_statuses(
+    buf: &mut [u8],
+    offset: &mut usize,
+    records: &[WriteAttributeStatus],
+) -> Result<(), ZclError> {
+    let has_failures = records.iter().any(|r| r.status != Status::Success);
+    if has_failures {
+        for record in records {
+            if record.status != Status::Success {
+                write_byte_payload(buf, offset, record.status as u8)?;
+                write_u16_payload(
+                    buf,
+                    offset,
+                    record.attribute_id.ok_or(ZclError::InvalidValue)?,
+                )?;
+            }
+        }
+    } else {
+        write_byte_payload(buf, offset, Status::Success as u8)?;
+    }
+    Ok(())
+}
+
+fn read_attribute_response_len(record: &ReadAttributeResponse<'_>) -> usize {
+    3 + match (record.status, record.value) {
+        (Status::Success, Some(value)) => 1 + zcl_data_type_len(value),
+        _ => 0,
+    }
+}
+
+fn attribute_report_len(record: &AttributeReport<'_>) -> usize {
+    3 + zcl_data_type_len(record.value)
+}
+
+fn write_attributes_response_len(records: &[WriteAttributeStatus]) -> usize {
+    if records.iter().any(|r| r.status != Status::Success) {
+        records
+            .iter()
+            .filter(|r| r.status != Status::Success)
+            .count()
+            * 3
+    } else {
+        1
+    }
+}
+
+fn zcl_data_type_len(value: ZclDataType<'_>) -> usize {
+    match value {
+        ZclDataType::NoData => 0,
+        ZclDataType::Data(v) => usize::from(v.type_id() - 0x07),
+        ZclDataType::Bool(_) => 1,
+        ZclDataType::Bitmap(v) => usize::from(v.type_id() - 0x17),
+        ZclDataType::UnsignedInt(v) => usize::from(v.type_id() - 0x1f),
+        ZclDataType::SignedInt(v) => usize::from(v.type_id() - 0x27),
+        ZclDataType::Enum(crate::common::data_types::EnumN::Enum8(_)) => 1,
+        ZclDataType::Enum(crate::common::data_types::EnumN::Enum16(_)) => 2,
+        ZclDataType::Float(crate::common::data_types::FloatN::Semi(_)) => 2,
+        ZclDataType::Float(crate::common::data_types::FloatN::Single(_)) => 4,
+        ZclDataType::Float(crate::common::data_types::FloatN::Double(_)) => 8,
+        ZclDataType::String(crate::common::data_types::ZclString::OctetString(v)) => 1 + v.len(),
+        ZclDataType::String(crate::common::data_types::ZclString::CharString(v)) => 1 + v.len(),
+        ZclDataType::String(crate::common::data_types::ZclString::LongOctetString(v)) => {
+            2 + v.len()
+        }
+        ZclDataType::String(crate::common::data_types::ZclString::LongCharString(v)) => 2 + v.len(),
+        ZclDataType::Time(_) => 4,
+        ZclDataType::Identifier(crate::common::data_types::IdentifierType::BACnetOid(_)) => 4,
+        ZclDataType::Identifier(_) => 2,
+        ZclDataType::Misc(crate::common::data_types::MiscType::IeeeAddress(_)) => 8,
+        ZclDataType::Misc(crate::common::data_types::MiscType::SecurityKey(_)) => 16,
+        ZclDataType::Array(values)
+        | ZclDataType::Structure(values)
+        | ZclDataType::Set(values)
+        | ZclDataType::Bag(values) => values.iter().copied().map(zcl_data_type_len).sum(),
+        ZclDataType::Unknown => 0,
+    }
+}
+
+fn byte_to_zcl_error(error: byte::Error) -> ZclError {
+    match error {
+        byte::Error::Incomplete => ZclError::InsufficientBytes,
+        byte::Error::BadInput { .. } | byte::Error::BadOffset(_) => ZclError::InvalidValue,
+    }
+}
+
+fn zcl_to_byte_error(error: ZclError) -> byte::Error {
+    match error {
+        ZclError::InsufficientBytes | ZclError::BufferTooSmall => byte::Error::Incomplete,
+        _ => bad_input!("invalid ZCL frame"),
     }
 }
 
@@ -49,13 +804,13 @@ pub enum Status {
     /// missing fields. Command not carried out. Implementer has discretion as
     /// to whether to return this error or [`Status::InvalidField`].
     MalformedCommand = 0x80,
-    /// The specified command is not supported on the device. Command not
-    /// carried out.
+    /// The specified cluster-specific command is not supported on the device.
+    /// Command not carried out.
     UnsupCommand = 0x81,
-    /// ~The specified general ZCL command is not supported on the device.~
-    ///
-    /// Use [`Status::UnsupCommand`]
-    #[deprecated(note = "Use `Status::UnsupCommand`")]
+    /// The specified global (general) ZCL command is not supported on the
+    /// device. Command not carried out. Use this — not [`Status::UnsupCommand`]
+    /// — when sending [`CommandResult::DefaultResponse`] for unrecognized
+    /// global commands per ZCL §2.4.12 / §2.5.12.
     UnsupGeneralCommand = 0x82,
     /// ~A manufacturer specific unicast, cluster specific command was received
     /// with an unknown manufacturer code, or the manufacturer code was
@@ -182,6 +937,7 @@ impl Status {
             0x7f => Ok(Self::Reserved),
             0x80 => Ok(Self::MalformedCommand),
             0x81 => Ok(Self::UnsupCommand),
+            0x82 => Ok(Self::UnsupGeneralCommand),
             0x85 => Ok(Self::InvalidField),
             0x86 => Ok(Self::UnsupportedAttribute),
             0x87 => Ok(Self::InvalidValue),
@@ -230,9 +986,9 @@ impl TryWrite<()> for Status {
         // wire.
         let raw: u8 = match self {
             Self::Unknown => return Err(bad_input!("unknown ZCL status")),
-            Self::UnsupGeneralCommand
-            | Self::UnsupManufClusterCommand
-            | Self::UnsupManufGeneralCommand => Self::UnsupCommand as u8,
+            Self::UnsupManufClusterCommand | Self::UnsupManufGeneralCommand => {
+                Self::UnsupCommand as u8
+            }
             Self::DuplicateExists | Self::LimitReached => Self::Success as u8,
             Self::WriteOnly => Self::NotAuthorized as u8,
             Self::InconsistentStartupState
@@ -247,24 +1003,14 @@ impl TryWrite<()> for Status {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub enum GeneralCommand<'a, const CMD_ATTR_CAPACITY: usize = 16> {
-    ReadAttributes(Vec<ReadAttribute, CMD_ATTR_CAPACITY>),
-    ReadAttributesResponse(Vec<ReadAttributeResponse<'a>, CMD_ATTR_CAPACITY>),
-    WriteAttributes(Vec<WriteAttribute<'a>, CMD_ATTR_CAPACITY>),
-    WriteAttributesResponse(Vec<WriteAttributeStatus, CMD_ATTR_CAPACITY>),
-    ReportAttributes(Vec<AttributeReport<'a>, CMD_ATTR_CAPACITY>),
-    DefaultResponse(DefaultResponse),
-}
-
 impl_byte! {
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ReadAttribute {
         pub attribute_id: u16,
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReadAttributeResponse<'a> {
     pub attribute_id: u16,
     pub status: Status,
@@ -315,7 +1061,7 @@ impl TryWrite<()> for ReadAttributeResponse<'_> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WriteAttribute<'a> {
     pub attribute_id: u16,
     pub value: ZclDataType<'a>,
@@ -426,7 +1172,7 @@ impl TryWrite<()> for DefaultResponse {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AttributeReport<'a> {
     pub attribute_id: u16,
     pub value: ZclDataType<'a>,
@@ -462,6 +1208,7 @@ impl TryWrite<()> for AttributeReport<'_> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic)]
+
     use byte::TryRead;
     use byte::TryWrite;
 
@@ -470,28 +1217,65 @@ mod tests {
     use crate::common::data_types::SignedN;
     use crate::common::data_types::UnsignedN;
     use crate::common::data_types::ZclString;
+    use crate::types::ids::TypeId;
+
+    #[test]
+    fn direction_opposite_maps_both_directions() {
+        assert_eq!(
+            Direction::ClientToServer.opposite(),
+            Direction::ServerToClient
+        );
+        assert_eq!(
+            Direction::ServerToClient.opposite(),
+            Direction::ClientToServer
+        );
+    }
+
+    #[test]
+    fn raw_command_id_interprets_global_and_cluster_contexts() {
+        let raw = RawCommandId::new(0x0b);
+        assert_eq!(raw.raw(), 0x0b);
+        assert_eq!(raw.known_global(), Some(CommandIdentifier::DefaultResponse));
+        assert_eq!(raw.cluster_specific(), CommandId::new(0x0b));
+        assert_eq!(RawCommandId::new(0x80).known_global(), None);
+        for raw in 0u8..=u8::MAX {
+            assert_eq!(RawCommandId::new(raw).raw(), raw);
+            assert_eq!(
+                RawCommandId::new(raw).cluster_specific(),
+                CommandId::new(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn response_meta_preserves_sequence_and_manufacturer_and_flips_direction() {
+        let input = [0x04, 0x34, 0x12, 0x55, 0x00];
+        let (frame, _) = IncomingZclFrame::decode(&input).expect("incoming frame parses");
+
+        let meta = ZclFrameMeta::response_to(&frame);
+
+        assert_eq!(meta.manufacturer_code, Some(ManufacturerCode(0x1234)));
+        assert_eq!(meta.sequence_number, 0x55);
+        assert_eq!(meta.direction, Direction::ServerToClient);
+        assert!(meta.disable_default_response);
+    }
 
     #[test]
     fn parse_attribute_report_payload() {
-        // given
         let input: &[u8] = &[
             0x00, 0x00, // identifier
             0x29, 0xab, 0x03,
         ];
 
-        // when
         let (report, _) = AttributeReport::try_read(input, ())
             .expect("Failed to read AttributeReport payload in test");
 
-        // then
         assert_eq!(report.attribute_id, 0u16);
         assert_eq!(report.value, ZclDataType::SignedInt(SignedN::Int16(939)));
     }
 
-    #[allow(clippy::panic)]
     #[test]
-    fn zcl_general_command() {
-        // given
+    fn incoming_report_attributes_is_known_unhandled_global() {
         let input: &[u8] = &[
             0x18, // frame control
             0x01, // sequence number
@@ -499,83 +1283,79 @@ mod tests {
             0x00, 0x00, 0x29, 0x3f, 0x0a, // payload
         ];
 
-        // when
-        let (frame, _) = ZclFrame::try_read(input, ()).expect("Failed to read ZclFrame");
+        let (frame, used) = IncomingZclFrame::decode(input).expect("Failed to read incoming frame");
 
-        // then
-        assert!(matches!(frame.payload, ZclFramePayload::GeneralCommand(_)));
-
-        if let ZclFramePayload::GeneralCommand(cmd) = frame.payload {
-            if let GeneralCommand::ReportAttributes(report) = cmd {
-                assert_eq!(report.len(), 1);
-                let attribute_report = report.first().expect("Expected ONE report in test");
-                assert_eq!(attribute_report.attribute_id, 0u16);
-                assert_eq!(
-                    attribute_report.value,
-                    ZclDataType::SignedInt(SignedN::Int16(2623))
-                );
-            } else {
-                panic!("Report Attributes Command expected!");
-            }
-        } else {
-            panic!("GeneralCommand expected!");
-        }
+        assert_eq!(used, input.len());
+        assert_eq!(frame.sequence_number(), 0x01);
+        assert_eq!(frame.direction(), Direction::ServerToClient);
+        assert!(matches!(
+            frame.command(),
+            IncomingZclCommand::Global(IncomingGlobalCommand::KnownUnhandled {
+                command_id: CommandIdentifier::ReportAttributes,
+                data
+            }) if *data == &input[3..]
+        ));
     }
 
-    #[allow(clippy::panic)]
     #[test]
-    fn cluster_specific_command() {
-        // given
+    fn incoming_global_request_variants_and_unknown_decode() {
+        let (frame, _) =
+            IncomingZclFrame::decode(&[0x00, 0x10, 0x03, 0x01, 0x00, 0x20, 0x2a]).unwrap();
+        assert!(matches!(
+            frame.command(),
+            IncomingZclCommand::Global(IncomingGlobalCommand::WriteAttributesUndivided(_))
+        ));
+
+        let (frame, _) =
+            IncomingZclFrame::decode(&[0x00, 0x11, 0x05, 0x01, 0x00, 0x20, 0x2a]).unwrap();
+        assert!(matches!(
+            frame.command(),
+            IncomingZclCommand::Global(IncomingGlobalCommand::WriteAttributesNoResponse(_))
+        ));
+
+        let (frame, _) = IncomingZclFrame::decode(&[0x00, 0x12, 0x0c, 0x34, 0x12, 0x7f]).unwrap();
+        assert!(matches!(
+            frame.command(),
+            IncomingZclCommand::Global(IncomingGlobalCommand::DiscoverAttributes {
+                start_attr: AttributeId(0x1234),
+                max_count: 0x7f,
+            })
+        ));
+
+        let (frame, _) = IncomingZclFrame::decode(&[0x00, 0x13, 0x80, 0xde, 0xad]).unwrap();
+        assert!(matches!(
+            frame.command(),
+            IncomingZclCommand::Global(IncomingGlobalCommand::Unknown {
+                command_id,
+                data,
+            }) if *command_id == RawCommandId::new(0x80) && *data == [0xde, 0xad]
+        ));
+    }
+
+    #[test]
+    fn incoming_cluster_specific_command_preserves_command_id_once() {
         let input: &[u8] = &[
             0x19, // frame control
             0x01, // sequence number
-            0x01, // command identifier
+            0x80, // command identifier
             0x00, 0x00, 0x29, 0x3f, 0x0a, // payload
         ];
 
-        // when
-        let (frame, _) = ZclFrame::try_read(input, ()).expect("Failed to read ZclFrame");
+        let (frame, used) = IncomingZclFrame::decode(input).expect("Failed to read incoming frame");
 
-        // then
-        let expected = &[0x00, 0x00, 0x29, 0x3f, 0x0a];
+        assert_eq!(used, input.len());
+        assert_eq!(frame.command_id().raw(), 0x80);
+        assert_eq!(frame.cluster_command_id(), Some(CommandId::new(0x80)));
+        assert_eq!(frame.global_command_id(), None);
         assert!(matches!(
-            frame.payload,
-            ZclFramePayload::ClusterSpecificCommand { .. }
+            frame.command(),
+            IncomingZclCommand::ClusterSpecific { command_id, data }
+                if *command_id == CommandId::new(0x80) && *data == &input[3..]
         ));
-        if let ZclFramePayload::ClusterSpecificCommand { command_id, data } = frame.payload {
-            assert_eq!(command_id.0, 0x01);
-            assert_eq!(data, expected);
-        } else {
-            panic!("ClusterSpecificCommand expected!");
-        }
     }
 
     #[test]
-    fn cluster_specific_command_preserves_unknown_command_id() {
-        let input: &[u8] = &[
-            0x01, // frame control: cluster-specific
-            0x01, // sequence number
-            0x80, // cluster-specific command identifier
-        ];
-
-        let (frame, _) = ZclFrame::try_read(input, ()).expect("Failed to read ZclFrame");
-
-        let ZclFramePayload::ClusterSpecificCommand { command_id, .. } = &frame.payload else {
-            panic!("ClusterSpecificCommand expected!");
-        };
-        assert_eq!(command_id.0, 0x80);
-        assert_eq!(frame.header.command_identifier.raw(), 0x80);
-
-        let mut buf = [0u8; 8];
-        let mut offset = 0usize;
-        buf.write_with(&mut offset, frame, ())
-            .expect("Failed to write ZclFrame");
-        assert_eq!(offset, input.len());
-        assert_eq!(&buf[..offset], input);
-    }
-
-    #[test]
-    fn read_attributes_frame_roundtrips() {
+    fn incoming_read_attributes_decodes_records() {
         let input: &[u8] = &[
             0x00, // frame control: global, client to server
             0x11, // sequence number
@@ -584,27 +1364,21 @@ mod tests {
             0x04, 0x00, // ManufacturerName
         ];
 
-        let (frame, len) = ZclFrame::try_read(input, ()).expect("read attributes request parses");
+        let (frame, len) = IncomingZclFrame::decode(input).expect("read attributes request parses");
         assert_eq!(len, input.len());
 
-        let ZclFramePayload::GeneralCommand(GeneralCommand::ReadAttributes(attrs)) = &frame.payload
+        let IncomingZclCommand::Global(IncomingGlobalCommand::ReadAttributes(attrs)) =
+            frame.command()
         else {
             panic!("ReadAttributesCommand expected");
         };
         assert_eq!(attrs.len(), 2);
         assert_eq!(attrs[0].attribute_id, 0x0000);
         assert_eq!(attrs[1].attribute_id, 0x0004);
-
-        let mut output = [0u8; 16];
-        let written = frame
-            .try_write(&mut output, ())
-            .expect("read attributes request writes");
-        assert_eq!(written, input.len());
-        assert_eq!(&output[..written], input);
     }
 
     #[test]
-    fn write_attributes_frame_roundtrips() {
+    fn incoming_write_attributes_decodes_raw_payload() {
         let input: &[u8] = &[
             0x00, // frame control: global, client to server
             0x12, // sequence number
@@ -617,66 +1391,51 @@ mod tests {
             0x02, b'O', b'K',
         ];
 
-        let (frame, len) = ZclFrame::try_read(input, ()).expect("write attributes request parses");
+        let (frame, len) =
+            IncomingZclFrame::decode(input).expect("write attributes request parses");
         assert_eq!(len, input.len());
 
-        let ZclFramePayload::GeneralCommand(GeneralCommand::WriteAttributes(attrs)) =
-            &frame.payload
+        let IncomingZclCommand::Global(IncomingGlobalCommand::WriteAttributes(payload)) =
+            frame.command()
         else {
-            panic!("WriteAttributesCommand expected");
+            panic!("WriteAttributes expected");
         };
-        assert_eq!(attrs.len(), 2);
-        assert_eq!(attrs[0].value, ZclDataType::Bool(true));
-        assert_eq!(
-            attrs[1].value,
-            ZclDataType::String(ZclString::CharString("OK"))
-        );
+        let mut iter = payload.records();
+        let r0 = iter.next().expect("record 0").expect("record 0 ok");
+        let r1 = iter.next().expect("record 1").expect("record 1 ok");
+        assert!(iter.next().is_none());
 
-        let mut output = [0u8; 32];
-        let written = frame
-            .try_write(&mut output, ())
-            .expect("write attributes request writes");
-        assert_eq!(written, input.len());
-        assert_eq!(&output[..written], input);
+        assert_eq!(r0.attr_id, AttributeId::new(0x0001));
+        assert_eq!(r0.type_id, TypeId::Boolean);
+        assert_eq!(r0.value, &[0x01u8]);
+        assert_eq!(r1.attr_id, AttributeId::new(0x0002));
+        assert_eq!(r1.type_id, TypeId::CharacterString);
+        assert_eq!(r1.value, &[0x02, b'O', b'K']);
     }
 
     #[test]
-    fn basic_cluster_read_attributes_response_writes_spec_records() {
-        let mut records = Vec::<ReadAttributeResponse<'_>, 16>::new();
-        records
-            .push(ReadAttributeResponse {
+    fn outgoing_read_attributes_response_writes_spec_records() {
+        let records = [
+            ReadAttributeResponse {
                 attribute_id: 0x0000, // ZCLVersion
                 status: Status::Success,
                 value: Some(ZclDataType::UnsignedInt(UnsignedN::Uint8(8))),
-            })
-            .unwrap();
-        records
-            .push(ReadAttributeResponse {
+            },
+            ReadAttributeResponse {
                 attribute_id: 0x0007, // PowerSource
                 status: Status::Success,
                 value: Some(ZclDataType::Enum(EnumN::Enum8(0x03))),
-            })
-            .unwrap();
-        records
-            .push(ReadAttributeResponse {
+            },
+            ReadAttributeResponse {
                 attribute_id: 0x0004, // ManufacturerName
                 status: Status::Success,
                 value: Some(ZclDataType::String(ZclString::CharString("Acme"))),
-            })
-            .unwrap();
-
-        let frame = ZclFrame {
-            header: ZclHeader {
-                frame_control: crate::header::frame_control::FrameControl(0x18),
-                manufacturer_code: None,
-                sequence_number: 0x22,
-                command_identifier:
-                    crate::header::command_identifier::CommandIdentifier::ReadAttributesResponse,
             },
-            payload: ZclFramePayload::GeneralCommand(GeneralCommand::ReadAttributesResponse(
-                records,
-            )),
-        };
+        ];
+        let frame = OutgoingZclFrame::global(
+            ZclFrameMeta::new(0x22, Direction::ServerToClient).disable_default_response(),
+            OutgoingGlobalCommand::ReadAttributesResponse(&records),
+        );
 
         let expected: &[u8] = &[
             0x18, 0x22, 0x01, // header
@@ -687,204 +1446,70 @@ mod tests {
 
         let mut output = [0u8; 32];
         let written = frame
-            .try_write(&mut output, ())
+            .encode(&mut output)
             .expect("basic cluster read response writes");
         assert_eq!(written, expected.len());
+        assert_eq!(frame.encoded_len(), expected.len());
         assert_eq!(&output[..written], expected);
 
         let (parsed, parsed_len) =
-            ZclFrame::try_read(&output[..written], ()).expect("basic cluster read response parses");
+            IncomingZclFrame::decode(&output[..written]).expect("response frame parses");
         assert_eq!(parsed_len, expected.len());
-        assert_eq!(parsed.header.sequence_number, 0x22);
+        assert_eq!(parsed.sequence_number(), 0x22);
+        assert!(matches!(
+            parsed.command(),
+            IncomingZclCommand::Global(IncomingGlobalCommand::KnownUnhandled {
+                command_id: CommandIdentifier::ReadAttributesResponse,
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn write_attributes_response_all_success_roundtrips() {
-        // All writes succeeded: single SUCCESS record, no attribute id.
-        let input: &[u8] = &[
-            0x18, // frame control: global, server to client, default response disabled
-            0x13, // sequence number
-            0x04, // Write Attributes Response
-            0x00, // SUCCESS — attribute id omitted
-        ];
-
-        let (frame, len) =
-            ZclFrame::try_read(input, ()).expect("all-success write response parses");
-        assert_eq!(len, input.len());
-
-        let ZclFramePayload::GeneralCommand(GeneralCommand::WriteAttributesResponse(ref records)) =
-            frame.payload
-        else {
-            panic!("WriteAttributesResponse expected");
-        };
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].status, Status::Success);
-        assert!(records[0].attribute_id.is_none());
-
-        let mut output = [0u8; 8];
-        let written = frame
-            .try_write(&mut output, ())
-            .expect("all-success write response writes");
-        assert_eq!(written, input.len());
-        assert_eq!(&output[..written], input);
-    }
-
-    #[test]
-    fn write_attributes_response_failure_records_roundtrip() {
-        // Some writes failed: only the failed records are present, each with attribute
-        // id.
-        let input: &[u8] = &[
-            0x18, // frame control: global, server to client, default response disabled
-            0x14, // sequence number
-            0x04, // Write Attributes Response
-            0x86, // UNSUPPORTED_ATTRIBUTE
-            0x99, 0x88, // attribute id
-        ];
-
-        let (frame, len) = ZclFrame::try_read(input, ()).expect("failure write response parses");
-        assert_eq!(len, input.len());
-
-        let ZclFramePayload::GeneralCommand(GeneralCommand::WriteAttributesResponse(ref records)) =
-            frame.payload
-        else {
-            panic!("WriteAttributesResponse expected");
-        };
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].status, Status::UnsupportedAttribute);
-        assert_eq!(records[0].attribute_id, Some(0x8899));
-
-        let mut output = [0u8; 16];
-        let written = frame
-            .try_write(&mut output, ())
-            .expect("failure write response writes");
-        assert_eq!(written, input.len());
-        assert_eq!(&output[..written], input);
-    }
-
-    #[test]
-    fn write_attributes_response_parses_mixed_success_and_failure_gracefully() {
-        // Non-compliant senders may mix SUCCESS with failures; parse gracefully.
-        let input: &[u8] = &[
-            0x18, // frame control
-            0x15, // sequence number
-            0x04, // Write Attributes Response
-            0x00, // SUCCESS record — no attr id
-            0x86, // UNSUPPORTED_ATTRIBUTE record
-            0x01, 0x00, // attribute id
-        ];
-        let (frame, len) = ZclFrame::try_read(input, ()).expect("mixed response parses gracefully");
-        assert_eq!(len, input.len());
-
-        let ZclFramePayload::GeneralCommand(GeneralCommand::WriteAttributesResponse(ref records)) =
-            frame.payload
-        else {
-            panic!("WriteAttributesResponse expected");
-        };
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].status, Status::Success);
-        assert!(records[0].attribute_id.is_none());
-        assert_eq!(records[1].status, Status::UnsupportedAttribute);
-        assert_eq!(records[1].attribute_id, Some(0x0001));
-    }
-
-    #[test]
-    fn write_attributes_response_normalizes_mixed_to_failures_on_write() {
-        // TryWrite drops SUCCESS records when failures are present.
-        let mut records = Vec::<WriteAttributeStatus, 16>::new();
-        records
-            .push(WriteAttributeStatus {
+    fn outgoing_write_attributes_response_normalizes_failures_and_success() {
+        let mixed = [
+            WriteAttributeStatus {
                 status: Status::Success,
                 attribute_id: None,
-            })
-            .unwrap();
-        records
-            .push(WriteAttributeStatus {
+            },
+            WriteAttributeStatus {
                 status: Status::UnsupportedAttribute,
                 attribute_id: Some(0x0001),
-            })
-            .unwrap();
-
-        let frame = ZclFrame {
-            header: ZclHeader {
-                frame_control: crate::header::frame_control::FrameControl(0x18),
-                manufacturer_code: None,
-                sequence_number: 0x20,
-                command_identifier:
-                    crate::header::command_identifier::CommandIdentifier::WriteAttributesResponse,
             },
-            payload: ZclFramePayload::GeneralCommand(GeneralCommand::WriteAttributesResponse(
-                records,
-            )),
-        };
+        ];
+        let frame = OutgoingZclFrame::global(
+            ZclFrameMeta::new(0x20, Direction::ServerToClient).disable_default_response(),
+            OutgoingGlobalCommand::WriteAttributesResponse(&mixed),
+        );
 
         let mut buf = [0u8; 16];
-        let written = frame
-            .try_write(&mut buf, ())
-            .expect("normalizes mixed on write");
+        let written = frame.encode(&mut buf).expect("normalizes mixed on write");
         let expected: &[u8] = &[
             0x18, 0x20, 0x04, // header
             0x86, 0x01, 0x00, // UNSUPPORTED_ATTRIBUTE for attribute 0x0001
         ];
         assert_eq!(&buf[..written], expected);
-    }
 
-    #[test]
-    fn write_attributes_response_normalizes_multiple_success_to_single() {
-        // Multiple SUCCESS records collapse to a single SUCCESS on write.
-        let mut records = Vec::<WriteAttributeStatus, 16>::new();
-        records
-            .push(WriteAttributeStatus {
+        let successes = [
+            WriteAttributeStatus {
                 status: Status::Success,
                 attribute_id: None,
-            })
-            .unwrap();
-        records
-            .push(WriteAttributeStatus {
-                status: Status::Success,
-                attribute_id: None,
-            })
-            .unwrap();
-
-        let frame = ZclFrame {
-            header: ZclHeader {
-                frame_control: crate::header::frame_control::FrameControl(0x18),
-                manufacturer_code: None,
-                sequence_number: 0x20,
-                command_identifier:
-                    crate::header::command_identifier::CommandIdentifier::WriteAttributesResponse,
             },
-            payload: ZclFramePayload::GeneralCommand(GeneralCommand::WriteAttributesResponse(
-                records,
-            )),
-        };
-
-        let mut buf = [0u8; 8];
-        let written = frame
-            .try_write(&mut buf, ())
-            .expect("normalizes multiple success");
-        let expected: &[u8] = &[
-            0x18, 0x20, 0x04, // header
-            0x00, // single SUCCESS
+            WriteAttributeStatus {
+                status: Status::Success,
+                attribute_id: None,
+            },
         ];
-        assert_eq!(&buf[..written], expected);
+        let frame = OutgoingZclFrame::global(
+            ZclFrameMeta::new(0x21, Direction::ServerToClient).disable_default_response(),
+            OutgoingGlobalCommand::WriteAttributesResponse(&successes),
+        );
+        let written = frame.encode(&mut buf).expect("normalizes multiple success");
+        assert_eq!(&buf[..written], &[0x18, 0x21, 0x04, 0x00]);
     }
 
     #[test]
-    fn unsupported_attribute_data_type_is_rejected() {
-        let input: &[u8] = &[
-            0x18, // frame control: global, server to client
-            0x15, // sequence number
-            0x01, // Read Attributes Response
-            0x00, 0x00, // attribute id
-            0x00, // success
-            0x48, // array: unsupported until structured types are implemented
-        ];
-
-        assert!(ZclFrame::try_read(input, ()).is_err());
-    }
-
-    #[test]
-    fn default_response_roundtrips() {
+    fn incoming_default_response_parses_and_outgoing_default_response_encodes() {
         let input: &[u8] = &[
             0x18, // frame control: global, server to client, default response disabled
             0x14, // sequence number
@@ -893,74 +1518,91 @@ mod tests {
             0x00, // success
         ];
 
-        let (frame, len) = ZclFrame::try_read(input, ()).expect("default response parses");
+        let (frame, len) = IncomingZclFrame::decode(input).expect("default response parses");
         assert_eq!(len, input.len());
 
-        let ZclFramePayload::GeneralCommand(GeneralCommand::DefaultResponse(ref dr)) =
-            frame.payload
+        let IncomingZclCommand::Global(IncomingGlobalCommand::DefaultResponse(dr)) =
+            frame.command()
         else {
             panic!("DefaultResponse expected");
         };
-        assert_eq!(dr.command_identifier, 0x00); // Read Attributes
+        assert_eq!(dr.command_identifier, 0x00);
         assert_eq!(dr.status, Status::Success);
+
+        assert!(OutgoingZclFrame::default_response(&frame, Status::Success).is_none());
+
+        let request = IncomingZclFrame::decode(&[0x00, 0x14, 0x00]).unwrap().0;
+        let response = OutgoingZclFrame::default_response(&request, Status::UnsupportedAttribute)
+            .expect("default response should be created for request");
+        let mut output = [0u8; 8];
+        let written = response
+            .encode(&mut output)
+            .expect("default response writes");
+        assert_eq!(&output[..written], &[0x18, 0x14, 0x0b, 0x00, 0x86]);
+    }
+
+    #[test]
+    fn incoming_decode_rejects_bad_required_payloads() {
+        assert!(IncomingZclFrame::decode(&[0x18, 0x14, 0x0b, 0x02, 0x7d]).is_err());
+        assert!(IncomingZclFrame::decode(&[0x00, 0x01, 0x0c, 0x00]).is_err());
+        assert!(IncomingZclFrame::decode(&[0x02, 0x01, 0x00]).is_err());
+        assert!(IncomingZclFrame::decode(&[0x04, 0x01]).is_err());
+    }
+
+    #[test]
+    fn outgoing_cluster_specific_encodes_from_single_command_id_source() {
+        let frame = OutgoingZclFrame::cluster_specific(
+            ZclFrameMeta::new(0x33, Direction::ClientToServer),
+            CommandId::new(0x80),
+            &[0xde, 0xad],
+        );
+
+        let mut output = [0u8; 8];
+        let written = frame.encode(&mut output).expect("cluster command writes");
+
+        assert_eq!(written, 5);
+        assert_eq!(&output[..written], &[0x01, 0x33, 0x80, 0xde, 0xad]);
+    }
+
+    #[test]
+    fn outgoing_manufacturer_specific_global_encodes_header_bit_and_code() {
+        let frame = OutgoingZclFrame::global(
+            ZclFrameMeta::new(0x44, Direction::ServerToClient)
+                .with_manufacturer_code(ManufacturerCode(0x1234))
+                .disable_default_response(),
+            OutgoingGlobalCommand::DefaultResponse(DefaultResponse {
+                command_identifier: 0x00,
+                status: Status::Success,
+            }),
+        );
 
         let mut output = [0u8; 8];
         let written = frame
-            .try_write(&mut output, ())
-            .expect("default response writes");
-        assert_eq!(written, input.len());
-        assert_eq!(&output[..written], input);
+            .encode(&mut output)
+            .expect("manufacturer frame writes");
+
+        assert_eq!(written, 7);
+        assert_eq!(
+            &output[..written],
+            &[0x1c, 0x34, 0x12, 0x44, 0x0b, 0x00, 0x00]
+        );
     }
 
     #[test]
-    fn default_response_rejects_unrecognized_status_byte() {
-        let input: &[u8] = &[
-            0x18, // frame control
-            0x14, // sequence number
-            0x0b, // Default Response
-            0x02, // command identifier: Write Attributes
-            0x7d, // unrecognized status byte
-        ];
+    fn outgoing_too_small_buffer_returns_zcl_error() {
+        let frame = OutgoingZclFrame::cluster_specific(
+            ZclFrameMeta::new(0x33, Direction::ClientToServer),
+            CommandId::new(0x80),
+            &[0xde, 0xad],
+        );
 
-        assert!(ZclFrame::try_read(input, ()).is_err());
-    }
-
-    #[test]
-    fn read_attribute_response_failure_record_roundtrips() {
-        let input: &[u8] = &[
-            0x18, // frame control: global, server to client
-            0x16, // sequence number
-            0x01, // Read Attributes Response
-            0x00, 0x00, // attribute id: ZCLVersion
-            0x86, // UNSUPPORTED_ATTRIBUTE — no data type or value follows
-        ];
-
-        let (frame, len) = ZclFrame::try_read(input, ()).expect("failure record parses");
-        assert_eq!(len, input.len());
-
-        let ZclFramePayload::GeneralCommand(GeneralCommand::ReadAttributesResponse(ref records)) =
-            frame.payload
-        else {
-            panic!("ReadAttributesResponse expected");
-        };
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].attribute_id, 0x0000);
-        assert_eq!(records[0].status, Status::UnsupportedAttribute);
-        assert!(records[0].value.is_none());
-
-        let mut output = [0u8; 16];
-        let written = frame
-            .try_write(&mut output, ())
-            .expect("failure record writes");
-        assert_eq!(written, input.len());
-        assert_eq!(&output[..written], input);
+        assert_eq!(frame.encode(&mut [0u8; 2]), Err(ZclError::BufferTooSmall));
     }
 
     #[test]
     fn read_attribute_response_rejects_inconsistent_status_value_combinations() {
         let mut buf = [0u8; 16];
 
-        // success status requires a value on write
         let no_value = ReadAttributeResponse {
             attribute_id: 0x0000,
             status: Status::Success,
@@ -968,7 +1610,6 @@ mod tests {
         };
         assert!(no_value.try_write(&mut buf, ()).is_err());
 
-        // failure status must not carry a value on write
         let spurious_value = ReadAttributeResponse {
             attribute_id: 0x0000,
             status: Status::UnsupportedAttribute,
