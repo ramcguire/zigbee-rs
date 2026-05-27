@@ -4,5 +4,5 @@
 //!
 //! Provides interfaces to Illuminance measurement and level sensing
 //! functionality, including configuration and provision of notifications of
-//! wheter the illuminance is within, above or below a target band and
+//! whether the illuminance is within, above or below a target band and
 //! illuminance measurements.
