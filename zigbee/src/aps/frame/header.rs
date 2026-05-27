@@ -15,7 +15,7 @@ impl_byte! {
         #[parse_if = frame_control.has_destination_endpoint()]
         pub destination_endpoint: Option<u8>,
         /// §2.2.5.1.3 — present only for group addressing
-        #[parse_if = frame_control.delivery_mode() == DeliveryMode::GroubAddressing]
+        #[parse_if = frame_control.delivery_mode() == DeliveryMode::GroupAddressing]
         pub group_address: Option<ShortAddress>,
         /// §2.2.5.1.4 — present for data and ack frames
         #[parse_if = frame_control.has_data_fields()]

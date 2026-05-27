@@ -5,8 +5,8 @@
 //! The application support sub-layer provides an interface between the
 //! `Network layer` and the `Application layer`.
 
-pub(crate) mod error;
-pub(crate) mod types;
+pub mod error;
+pub mod types;
 
 /// The APS data entity provides the data transmission service between two or
 /// more application entities located on the same network.

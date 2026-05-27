@@ -28,6 +28,7 @@ use basemgt::ApsmeUnbindConfirm;
 use basemgt::ApsmeUnbindRequest;
 use basemgt::ApsmeUnbindRequestStatus;
 use byte::BytesExt;
+use byte::TryRead;
 use zigbee_types::IeeeAddress;
 use zigbee_types::ShortAddress;
 
@@ -71,6 +72,17 @@ pub trait ApsmeSap {
         request: ApsmeRemoveAllGroupsRequest,
     ) -> ApsmeRemoveAllGroupsConfirm;
 }
+pub(crate) const DATA_FRAME_BUFFER_LEN: usize = 100;
+pub(crate) const DATA_FRAME_HEADER_LEN: usize = 8;
+pub(crate) const MAX_DATA_ASDU_LEN: usize = DATA_FRAME_BUFFER_LEN - DATA_FRAME_HEADER_LEN;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ApsDuplicateRecord {
+    source: ShortAddress,
+    counter: u8,
+    frame_type: FrameType,
+    secured: bool,
+}
 
 /// APS Management Entity (§2.2.4).
 pub(crate) struct Apsme {
@@ -79,6 +91,7 @@ pub(crate) struct Apsme {
     pub(crate) joined_network: Option<Address>,
     /// apsCounter AIB attribute (§4.4.11)
     pub(crate) aps_counter: u8,
+    duplicate_table: heapless::Vec<ApsDuplicateRecord, 8>,
 }
 
 impl Apsme {
@@ -88,11 +101,35 @@ impl Apsme {
             binding_table: ApsBindingTable::new(),
             joined_network: None,
             aps_counter: 0,
+            duplicate_table: heapless::Vec::new(),
         }
     }
 
     fn is_joined(&self) -> bool {
         self.joined_network.is_some()
+    }
+
+    pub(crate) fn accept_incoming(
+        &mut self,
+        source: ShortAddress,
+        counter: u8,
+        frame_type: FrameType,
+        secured: bool,
+    ) -> bool {
+        let record = ApsDuplicateRecord {
+            source,
+            counter,
+            frame_type,
+            secured,
+        };
+        if self.duplicate_table.iter().any(|entry| *entry == record) {
+            return false;
+        }
+        if self.duplicate_table.push(record).is_err() {
+            self.duplicate_table.remove(0);
+            let _ = self.duplicate_table.push(record);
+        }
+        true
     }
 
     /// Build and send an APS command frame to a specific destination (§4.4).
@@ -148,12 +185,17 @@ impl Apsme {
         retries: u8,
     ) -> Result<Command, NetworkError> {
         let mut buf = [0u8; 128];
-        let mut nwk_data = nlme.poll_nwk_data(&mut buf, retries).await?;
-
-        // SAFETY: we can safely take a &mut since it references the buf above
-        let aps_buf = unsafe { nwk_data.payload_as_mut() };
+        let nwk_data = nlme.poll_nwk_data(&mut buf, retries).await?;
+        let payload_range = nwk_data.payload_range();
+        let (header, _) = Header::try_read(nwk_data.payload, ())?;
+        if header.frame_control.frame_type() != FrameType::Command
+            || !header.frame_control.security_flag()
+        {
+            return Err(NetworkError::ParseError);
+        }
+        drop(nwk_data);
         let cx = SecurityContext::get();
-        let aps_frame = cx.decrypt_aps_frame_in_place(aps_buf)?;
+        let aps_frame = cx.decrypt_aps_frame_in_place(&mut buf[payload_range])?;
 
         let Frame::ApsCommand(CommandFrame { command, .. }) = aps_frame else {
             return Err(NetworkError::ParseError);
@@ -172,12 +214,14 @@ impl Apsme {
         profile_id: u16,
         src_endpoint: u8,
         payload: &[u8],
+        tx_options: TxOptions,
     ) -> Result<(), NetworkError> {
         self.aps_counter = self.aps_counter.wrapping_add(1);
 
         let frame_control = FrameControl::default()
             .set_frame_type(FrameType::Data)
-            .set_delivery_mode(DeliveryMode::Unicast);
+            .set_delivery_mode(DeliveryMode::Unicast)
+            .set_ack_request(tx_options.ack_requested());
 
         let header = Header {
             frame_control,
@@ -190,15 +234,17 @@ impl Apsme {
             extended_header: None,
         };
 
-        let mut buf = [0u8; 100];
+        let mut buf = [0u8; DATA_FRAME_BUFFER_LEN];
         let offset = &mut 0;
         buf.write_with(offset, header, ())?;
 
         let hdr_len = *offset;
-        let payload_len = payload.len().min(buf.len() - hdr_len);
-        buf[hdr_len..hdr_len + payload_len].copy_from_slice(&payload[..payload_len]);
+        if payload.len() > buf.len() - hdr_len {
+            return Err(NetworkError::InvalidFrame);
+        }
+        buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
 
-        nlme.send_data(destination, false, &buf[..hdr_len + payload_len])
+        nlme.send_data(destination, false, &buf[..hdr_len + payload.len()])
             .await
     }
 
@@ -233,15 +279,17 @@ impl Apsme {
             extended_header: None,
         };
 
-        let mut buf = [0u8; 100];
+        let mut buf = [0u8; DATA_FRAME_BUFFER_LEN];
         let offset = &mut 0;
         buf.write_with(offset, header, ())?;
 
         let hdr_len = *offset;
-        let payload_len = payload.len().min(buf.len() - hdr_len);
-        buf[hdr_len..hdr_len + payload_len].copy_from_slice(&payload[..payload_len]);
+        if payload.len() > buf.len() - hdr_len {
+            return Err(NetworkError::InvalidFrame);
+        }
+        buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
 
-        nlme.broadcast_data(nwk_broadcast, false, &buf[..hdr_len + payload_len])
+        nlme.broadcast_data(nwk_broadcast, false, &buf[..hdr_len + payload.len()])
             .await
     }
 }

@@ -197,9 +197,10 @@ impl<'a> SecurityContext<'a> {
         let (nwk_hdr, _) = NwkHeader::try_read(hdr_buf, ())?;
         if !nwk_hdr.frame_control.security_flag() {
             // no security enabled for frame, exit with payload
-            return Ok(NwkFrame::from_payload(
+            return Ok(Self::nwk_frame_from_payload(
                 nwk_hdr,
                 &frame_buffer[nwk_hdr_len..],
+                nwk_hdr_len,
             )?);
         }
 
@@ -211,22 +212,23 @@ impl<'a> SecurityContext<'a> {
         }
 
         // 2) select the key from NIB
-        let sec_material = self.nib.security_material_set();
-        let sec_material = sec_material
+        let mut sec_material_set = self.nib.security_material_set();
+        let sec_material_index = sec_material_set
             .iter()
-            .find(|k| {
+            .position(|k| {
                 aux_hdr
                     .key_sequence_number
                     .is_some_and(|ksn| ksn == k.key_seq_number)
             })
             .ok_or(SecurityError::Unspecified)?;
-        let key = sec_material.key.as_slice();
+        let key = sec_material_set[sec_material_index].key;
+        let key = key.as_slice();
 
-        // 3) check if frame_counter is equal or greater of the NIB
+        // 3) check the incoming frame counter against the next accepted value.
         let Some(source_address) = aux_hdr.source_address else {
             return Err(SecurityError::InvalidData);
         };
-        if sec_material
+        if sec_material_set[sec_material_index]
             .incoming_frame_counter_set
             .iter()
             .find(|i| source_address == i.sender_address)
@@ -254,7 +256,39 @@ impl<'a> SecurityContext<'a> {
             .decrypt_in_place_detached(&nonce, aad, enc_data, tag)
             .map_err(SecurityError::CcmError)?;
 
-        Ok(NwkFrame::from_payload(nwk_hdr, enc_data)?)
+        let next_counter = aux_hdr
+            .frame_counter
+            .checked_add(1)
+            .ok_or(SecurityError::InvalidData)?;
+        let counters = &mut sec_material_set[sec_material_index].incoming_frame_counter_set;
+        if let Some(counter) = counters
+            .iter_mut()
+            .find(|counter| counter.sender_address == source_address)
+        {
+            counter.incoming_frame_counter = next_counter;
+        } else {
+            counters
+                .push(crate::nwk::nib::IncomingFrameCounterDescriptor {
+                    sender_address: source_address,
+                    incoming_frame_counter: next_counter,
+                })
+                .map_err(|_| SecurityError::Unspecified)?;
+        }
+        self.nib.set_security_material_set(sec_material_set);
+
+        Self::nwk_frame_from_payload(nwk_hdr, enc_data, nwk_hdr_len + aux_hdr_len)
+    }
+
+    fn nwk_frame_from_payload<'b>(
+        nwk_hdr: NwkHeader<'b>,
+        payload: &'b [u8],
+        payload_offset: usize,
+    ) -> Result<NwkFrame<'b>, SecurityError> {
+        let mut frame = NwkFrame::from_payload(nwk_hdr, payload)?;
+        if let NwkFrame::Data(data) = &mut frame {
+            data.payload_offset = payload_offset;
+        }
+        Ok(frame)
     }
 
     pub fn encrypt_aps_frame_in_place(
@@ -325,9 +359,7 @@ impl<'a> SecurityContext<'a> {
         security_control.set_security_level(sec_level);
         security_control.set_key_identifier(key_id);
 
-        if matches!(aps_frame, ApsFrame::ApsCommand(_))
-            || matches!(tx_options, TxOptions::IncludeExtendedNonce)
-        {
+        if matches!(aps_frame, ApsFrame::ApsCommand(_)) || tx_options.include_extended_nonce() {
             security_control.set_extended_nonce(true);
         }
 
@@ -476,9 +508,7 @@ impl<'a> SecurityContext<'a> {
         };
 
         // step 4
-        if matches!(key_config.link_key_type, LinkKeyType::UniqueLinkKey)
-            && aux_hdr.frame_counter < key_config.incoming_frame_counter
-        {
+        if aux_hdr.frame_counter < key_config.incoming_frame_counter {
             return Err(SecurityError::Unspecified);
         }
 
@@ -503,6 +533,12 @@ impl<'a> SecurityContext<'a> {
         cipher
             .decrypt_in_place_detached(&nonce, aad, enc_data, tag)
             .map_err(SecurityError::CcmError)?;
+
+        key_config.incoming_frame_counter = aux_hdr
+            .frame_counter
+            .checked_add(1)
+            .ok_or(SecurityError::InvalidData)?;
+        self.aib.set_device_key_pair_set(key_set);
 
         Ok(ApsFrame::from_payload(aps_hdr, enc_data)?)
     }
@@ -639,7 +675,7 @@ mod tests {
         let mut got_buffer = [0u8; 21];
 
         let offset = security_context
-            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(offset, frame_buffer.len());
@@ -683,7 +719,7 @@ mod tests {
 
         let mut got_buffer = [0u8; 54];
         let offset = security_context
-            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(offset, frame_buffer.len());
@@ -727,7 +763,7 @@ mod tests {
 
         let mut got_buffer = [0u8; 128];
         let offset = security_context
-            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(offset, frame_buffer.len());
@@ -803,6 +839,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(nib.security_material_set()[0].outgoing_frame_counter, 2);
+        let mut sec = nib.security_material_set();
+        sec[0].incoming_frame_counter_set.clear();
+        nib.set_security_material_set(sec);
 
         // encrypt again — counter should keep incrementing
         let mut frame_buffer = NWK_FRAME_CMD_BUFFER;
@@ -882,7 +921,7 @@ mod tests {
             .decrypt_aps_frame_in_place(&mut dec_buf)
             .unwrap();
         security_context
-            .encrypt_aps_frame_in_place(frame, &mut buf, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut buf, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(
@@ -894,13 +933,18 @@ mod tests {
             1
         );
 
+        let mut key_set = aib.device_key_pair_set();
+        for entry in key_set.iter_mut() {
+            entry.incoming_frame_counter = 0;
+        }
+        aib.set_device_key_pair_set(key_set);
         // second encryption — counter should be 2
         let mut dec_buf = frame_buffer;
         let frame = security_context
             .decrypt_aps_frame_in_place(&mut dec_buf)
             .unwrap();
         security_context
-            .encrypt_aps_frame_in_place(frame, &mut buf, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut buf, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(

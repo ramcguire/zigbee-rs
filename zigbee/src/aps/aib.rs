@@ -47,8 +47,11 @@ impl_byte! {
 
 // TODO
 impl_byte! {
-    #[derive(Debug, Clone)]
-    pub struct ApsGroup(u8);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ApsGroup {
+        pub group_address: u16,
+        pub endpoint: u8,
+    }
 }
 
 // TODO
