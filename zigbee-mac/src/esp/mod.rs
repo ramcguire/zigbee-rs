@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 use byte::BytesExt;
 use embassy_futures::select::Either;
@@ -15,6 +16,7 @@ use ieee802154::mac::Header;
 use ieee802154::mac::command::CapabilityInformation;
 use ieee802154::mac::command::Command;
 use ieee802154::mac::security::SecurityContext;
+use zigbee_types::ShortAddress;
 
 use crate::esp::driver::Ieee802154Driver;
 use crate::mlme::A_BASE_SUPER_FRAME_DURATION;
@@ -22,6 +24,7 @@ use crate::mlme::A_RESPONSE_WAIT_TIME;
 use crate::mlme::AssociationResponse;
 use crate::mlme::MAX_IEEE802154_CHANNELS;
 use crate::mlme::MacError;
+use crate::mlme::MlmeSyncRequest;
 use crate::mlme::Mlme;
 use crate::mlme::PanDescriptor;
 use crate::mlme::PanDescriptorList;
@@ -29,6 +32,48 @@ use crate::mlme::ScanResult;
 use crate::mlme::ScanType;
 
 mod driver;
+
+/// Compile-time mapper from a hardware-reported LQI value into the IEEE
+/// 802.15.4/Zigbee 0–255 link-quality range.
+pub trait LqiMapper {
+    fn map(raw: u8) -> u8;
+}
+
+/// LQI mapping for radios that already report the IEEE 802.15.4 0–255 range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityLqi;
+
+impl LqiMapper for IdentityLqi {
+    #[inline(always)]
+    fn map(raw: u8) -> u8 {
+        raw
+    }
+}
+
+/// Linear LQI mapping from a raw `0..=RAW_MAX` hardware range to `0..=255`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinearLqi<const RAW_MAX: u8>;
+
+impl<const RAW_MAX: u8> LqiMapper for LinearLqi<RAW_MAX> {
+    #[inline(always)]
+    fn map(raw: u8) -> u8 {
+        if RAW_MAX == 0 {
+            return 0;
+        }
+
+        let scaled = u16::from(raw) * u16::from(u8::MAX) / u16::from(RAW_MAX);
+        if scaled > u16::from(u8::MAX) {
+            u8::MAX
+        } else {
+            scaled as u8
+        }
+    }
+}
+
+/// ESP32-C6 IEEE 802.15.4 peripheral LQI mapping.
+///
+/// The ESP32-C6 derives LQI from RSSI and reports it on a 0–100 scale.
+pub type Esp32c6Lqi = LinearLqi<100>;
 
 /// Wait for the first frame matching `$pat` within `$timeout_us` microseconds,
 /// skipping non-matching frames. Evaluates `$body` on match. Returns
@@ -41,8 +86,24 @@ macro_rules! recv_frame {
                 let frame = $self.next_frame().await?;
                 match frame {
                     $($pat => return Ok($body),)+
-                    _ => {
-                        log::debug!("[MLME-POLL] received other frame");
+                    f => {
+                        let kind = match &f.frame.content {
+                            ieee802154::mac::FrameContent::Data => "data",
+                            ieee802154::mac::FrameContent::Beacon(_) => "beacon",
+                            ieee802154::mac::FrameContent::Acknowledgement => "ack",
+                            ieee802154::mac::FrameContent::Command(_) => "mac-cmd",
+                            _ => "other",
+                        };
+                        log::debug!("[MLME-POLL] received other frame kind={kind}");
+                        // Preserve data frames (e.g. Transport-Key delivered in
+                        // promiscuous mode during association) for poll_data to
+                        // return on its first call.
+                        if let ieee802154::mac::FrameContent::Data = &f.frame.content {
+                            let len = f.frame.payload.len().min(128);
+                            let mut saved = [0u8; 128];
+                            saved[..len].copy_from_slice(&f.frame.payload[..len]);
+                            $self.pending_frame = Some((saved, len, f.lqi));
+                        }
                         continue;
                     },
                 }
@@ -55,21 +116,52 @@ macro_rules! recv_frame {
     }};
 }
 
-pub struct EspMlme<'a> {
+pub struct EspMlme<'a, M: LqiMapper = Esp32c6Lqi> {
     driver: Ieee802154Driver<'a>,
     seq_number: u8,
+    _lqi: PhantomData<M>,
+    /// MAC data frame received during an `associate()` recv_frame loop that
+    /// did not match the expected pattern (e.g. Transport-Key delivery during
+    /// the association window in promiscuous mode).  `poll_data` returns this
+    /// before sending a new data request so upper layers can process it.
+    pending_frame: Option<([u8; 128], usize, u8)>,
 }
 
-impl<'a> EspMlme<'a> {
+impl<'a> EspMlme<'a, Esp32c6Lqi> {
+    /// Construct an ESP32-C6 MLME using the ESP hardware LQI scale conversion.
     pub fn new(ieee802154: Ieee802154<'a>, config: Config) -> Self {
+        Self::new_with_lqi_mapper(ieee802154, config)
+    }
+}
+
+impl<'a, M: LqiMapper> EspMlme<'a, M> {
+    /// Construct an MLME with a compile-time-selected LQI mapper.
+    ///
+    /// Use `EspMlme::<IdentityLqi>::new_with_lqi_mapper(...)` when the radio
+    /// already reports the IEEE 802.15.4 0–255 LQI range, or
+    /// `EspMlme::<LinearLqi<127>>::new_with_lqi_mapper(...)` for another
+    /// fixed-width hardware scale.
+    pub fn new_with_lqi_mapper(ieee802154: Ieee802154<'a>, config: Config) -> Self {
         Self {
             driver: Ieee802154Driver::new(ieee802154, config),
             seq_number: 0,
+            _lqi: PhantomData,
+            pending_frame: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_lqi_mapper<N: LqiMapper>(self) -> EspMlme<'a, N> {
+        EspMlme {
+            driver: self.driver,
+            seq_number: self.seq_number,
+            _lqi: PhantomData,
+            pending_frame: None,
         }
     }
 }
 
-impl EspMlme<'_> {
+impl<M: LqiMapper> EspMlme<'_, M> {
     fn sequence_number(&mut self) -> u8 {
         self.seq_number = self.seq_number.wrapping_add(1);
         self.seq_number
@@ -95,11 +187,12 @@ impl EspMlme<'_> {
         [0x3, 0x8, seq_number, 0xff, 0xff, 0xff, 0xff, 0x7, 0x0, 0x0]
     }
 
-    async fn scan_channel_active(
+    async fn scan_channel(
         &mut self,
         channel: u8,
         duration: u8,
-    ) -> Result<Option<PanDescriptorList>, MacError> {
+        active: bool,
+    ) -> Result<PanDescriptorList, MacError> {
         self.flush();
         self.driver.update_driver_config(|config| {
             config.promiscuous = false;
@@ -107,12 +200,13 @@ impl EspMlme<'_> {
         });
         self.driver.start_receive();
 
-        let frame = self.beacon_request_frame();
-        if let Err(e) = self.driver.transmit(&frame).await {
-            log::error!("[MLME-SCAN]: error transmitting beacon: {e}");
+        if active {
+            let frame = self.beacon_request_frame();
+            if let Err(e) = self.driver.transmit(&frame).await {
+                log::error!("[MLME-SCAN]: error transmitting beacon: {e}");
+            }
+            log::debug!("[MLME-SCAN] sent beacon frame to channel {channel}, waiting for messages...");
         }
-
-        log::debug!("[MLME-SCAN] sent beacon frame to channel {channel}, waiting for messages...");
 
         let delay_us: u64 = calculate_scan_duration_max_us(duration).into();
         log::debug!("[MLME-SCAN] waiting for response for {delay_us}us");
@@ -133,7 +227,7 @@ impl EspMlme<'_> {
             }
         }
 
-        Ok(Some(pds))
+        Ok(pds)
     }
 
     fn parse_beacon(&self, received: ReceivedFrame) -> Option<PanDescriptor> {
@@ -173,7 +267,7 @@ impl EspMlme<'_> {
                     coord_pan_id: source.pan_id().0.into(),
                     coord_address: source,
                     superframe_spec: beacon_content.superframe_spec,
-                    link_quality: lqi,
+                    link_quality: M::map(lqi),
                     security_use: hdr.has_security(),
                     zigbee_beacon,
                 })
@@ -263,33 +357,33 @@ fn calculate_scan_duration_max_us(duration: u8) -> u32 {
     16 * A_BASE_SUPER_FRAME_DURATION * (2 * (duration as u32) + 1)
 }
 
-impl Mlme for EspMlme<'_> {
+impl<M: LqiMapper> Mlme for EspMlme<'_, M> {
     async fn scan_network(
         &mut self,
         scan_type: ScanType,
         channels: core::ops::Range<u8>,
         duration: u8,
     ) -> Result<ScanResult, MacError> {
-        if !matches!(scan_type, ScanType::Active) {
+        if matches!(scan_type, ScanType::Ed | ScanType::Orphan) {
             return Err(MacError::InvalidScanParams);
         }
 
         log::debug!("[MLME-SCAN] start scan");
 
+        let active = !matches!(scan_type, ScanType::Passive);
         let mut pan_descriptor = Vec::new();
         for c in channels {
             if (c as usize) >= MAX_IEEE802154_CHANNELS {
                 continue;
             }
 
-            match self.scan_channel_active(c, duration).await {
-                Ok(Some(mut pd)) => {
+            match self.scan_channel(c, duration, active).await {
+                Ok(mut pd) => {
                     pan_descriptor.append(&mut pd);
                 }
                 Err(e) => {
                     log::error!("[MLME-SCAN] error on channel {c}: {e}");
                 }
-                _ => (),
             }
         }
 
@@ -299,12 +393,30 @@ impl Mlme for EspMlme<'_> {
         })
     }
 
+    fn set_channel(&mut self, channel: u8, pan_id: ShortAddress) -> Result<(), MacError> {
+        if (channel as usize) >= MAX_IEEE802154_CHANNELS {
+            return Err(MacError::InvalidScanParams);
+        }
+        self.driver.update_driver_config(|config| {
+            config.channel = channel;
+            config.pan_id = Some(pan_id.0);
+            config.auto_ack_tx = true;
+            config.auto_ack_rx = true;
+            config.promiscuous = false;
+        });
+        self.driver.start_receive();
+        Ok(())
+    }
+
     async fn associate(
         &mut self,
         channel: u8,
         dest: Address,
         capabilities: CapabilityInformation,
     ) -> Result<AssociationResponse, MacError> {
+        // Clear any frame saved from a previous association attempt.
+        self.pending_frame = None;
+
         // Use promiscuous mode during association since we don't have a
         // short address yet and the hardware filter may not match on
         // ext_addr alone.
@@ -375,6 +487,16 @@ impl Mlme for EspMlme<'_> {
         coord_address: Address,
         buf: &mut [u8],
     ) -> Result<(usize, u8), MacError> {
+        // Return any data frame saved during a prior recv_frame! call before
+        // sending a new data request.  This handles Transport-Key frames
+        // delivered in promiscuous mode during the association window.
+        if let Some((pending_buf, len, raw_lqi)) = self.pending_frame.take() {
+            let copy_len = len.min(buf.len());
+            buf[..copy_len].copy_from_slice(&pending_buf[..copy_len]);
+            log::debug!("[MLME-POLL] rx data from pending len={copy_len}");
+            return Ok((copy_len, M::map(raw_lqi)));
+        }
+
         self.flush();
         let data_req = self.data_request_frame(coord_address)?;
         self.driver.transmit(&data_req).await?;
@@ -390,7 +512,7 @@ impl Mlme for EspMlme<'_> {
                 let len = payload.len().min(buf.len());
                 log::debug!("[MLME-POLL] rx data len={len}");
                 buf[..len].copy_from_slice(&payload[..len]);
-                (len, lqi)
+                (len, M::map(lqi))
             },
         )
     }
@@ -434,6 +556,36 @@ impl Mlme for EspMlme<'_> {
         self.driver.transmit(&frame_buf[..total_len]).await?;
         log::debug!("[MLME] tx data, len={total_len}");
 
+        Ok(())
+    }
+
+    fn sync(&mut self, request: MlmeSyncRequest) -> Result<(), MacError> {
+        if !(11..=26).contains(&request.logical_channel) {
+            return Err(MacError::InvalidScanParams);
+        }
+        self.driver.update_driver_config(|config| {
+            config.channel = request.logical_channel;
+            config.pan_id = Some(request.pan_id.0);
+            config.rx_when_idle = request.track_beacon;
+        });
+        self.driver.start_receive();
+        Ok(())
+    }
+
+    fn reset(&mut self, set_default_pib: bool) -> Result<(), MacError> {
+        self.flush();
+        if set_default_pib {
+            // Preserve the IEEE address; reset all PIB fields.
+            let ieee_addr = self.driver.ieee_address().0;
+            self.driver.update_driver_config(|config| {
+                let default = esp_radio::ieee802154::Config::default();
+                *config = default;
+                config.ext_addr = Some(ieee_addr);
+                config.rx_when_idle = true;
+            });
+        }
+        // Always re-enter receive mode so the driver is in a known state.
+        self.driver.start_receive();
         Ok(())
     }
 }

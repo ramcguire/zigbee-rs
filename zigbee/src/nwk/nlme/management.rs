@@ -92,10 +92,25 @@ pub struct NlmePermitJoiningConfirm {
 pub struct NlmeStartRouterRequest {}
 /// 3.2.2.10 - NLME-START-ROUTER.confirm
 pub struct NlmeStartRouterConfirm {}
-/// 3.2.2.11 - NLME-ED-SCAN.request
-pub struct NlmeEdScanRequest {}
+/// 3.2.2.11 - NLME-ED-SCAN.request (§3.2.2.11)
+pub struct NlmeEdScanRequest {
+    pub channel_list: core::ops::Range<u8>,
+    pub scan_duration: u8,
+}
+
 /// 3.2.2.12 - NLME-ED-SCAN.confirm
-pub struct NlmeEdScanConfirm {}
+///
+/// `energy_detect_list` is indexed by channel offset from `channel_list.start`.
+/// Not implemented in the ESP MLME (hardware API not available); currently
+/// always returns `status = MacError`.
+pub struct NlmeEdScanConfirm {
+    pub status: NlmeJoinStatus,
+    pub scanned_channels: core::ops::Range<u8>,
+    #[cfg(feature = "alloc")]
+    pub energy_detect_list: alloc::vec::Vec<u8>,
+    #[cfg(not(feature = "alloc"))]
+    pub energy_detect_list: heapless::Vec<u8, { zigbee_mac::mlme::MAX_IEEE802154_CHANNELS }>,
+}
 /// Method used to join or rejoin a network (Table 3-21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejoinNetwork {
@@ -166,13 +181,108 @@ pub struct NlmeDirectJoinRequest {}
 pub struct NlmeDirectJoinConfirm {}
 
 /// 3.2.2.18 - NLME-LEAVE.request
-pub struct NlmeLeaveRequest {}
+pub struct NlmeLeaveRequest {
+    /// If true, device intends to rejoin; preserve all crypto/PAN state.
+    /// If false, perform a permanent leave and clear network state.
+    pub rejoin: bool,
+    /// Request that children also leave (router/coordinator only).
+    pub remove_children: bool,
+    /// Whether this leave was initiated locally or by the network.
+    pub source: LeaveSource,
+}
+
+/// Identifies who initiated the leave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaveSource {
+    Local,
+    NetworkRequest { source: ShortAddress },
+}
+
+/// Status codes for NLME-LEAVE.confirm (§3.2.2.20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NlmeLeaveStatus {
+    Success,
+    InvalidRequest,
+    NotJoined,
+}
+
 /// 3.2.2.19 - NLME-LEAVE.indication
-pub struct NlmeLeaveIndication {}
+pub struct NlmeLeaveIndication {
+    pub source: ShortAddress,
+    pub rejoin: bool,
+    pub remove_children: bool,
+}
+
 /// 3.2.2.20 - NLME-LEAVE.confirm
-pub struct NlmeLeaveConfirm {}
+pub struct NlmeLeaveConfirm {
+    pub status: NlmeLeaveStatus,
+    pub rejoin: bool,
+}
 
 /// 3.2.2.21 - NLME-RESET.request
-pub struct NlmeResetRequest {}
+#[derive(Copy, Clone)]
+pub struct NlmeResetRequest {
+    /// Warm reset: preserve PAN/security data; only clear transient state.
+    /// Cold reset: clear all Zigbee state except outgoing NWK frame counter.
+    pub warm_start: bool,
+}
+
 /// 3.2.2.22 - NLME-RESET.confirm
-pub struct NlmeResetConfirm {}
+pub struct NlmeResetConfirm {
+    pub status: NlmeResetStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NlmeResetStatus {
+    Success,
+    MacError,
+}
+
+/// NLME-SYNC.request — tune radio to current parent's channel (§3.2.2.26).
+#[derive(Copy, Clone)]
+pub struct NlmeSyncRequest {
+    /// If true, remain in beacon-tracking (rx_when_idle) mode.
+    /// If false, perform a one-shot sync.
+    pub track_beacon: bool,
+}
+
+/// NLME-SYNC.confirm
+pub struct NlmeSyncConfirm {
+    pub status: NlmeSyncStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NlmeSyncStatus {
+    Success,
+    /// No parent in the neighbor table.
+    NoSynchronization,
+    /// MAC rejected the channel/PAN parameters.
+    InvalidRequest,
+}
+
+/// NLME-REJOIN.request — wraps the NWK rejoin procedure (§3.6.1.4.3).
+///
+/// Separate from `NlmeJoinRequest` so callers don't have to fill all
+/// NLME-JOIN table fields.
+pub struct NlmeRejoinRequest {
+    pub extended_pan_id: IeeeAddress,
+    /// Capability information to advertise in the RejoinRequest frame.
+    pub capability_information: CapabilityInformation,
+    /// Must be true for M1; insecure / TC rejoin is a future milestone.
+    pub secure: bool,
+    /// Channel scan strategy.
+    pub scan: RejoinScan,
+}
+
+/// How to find a parent during rejoin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejoinScan {
+    /// Use the current channel and current parent — no scan needed.
+    SameChannel,
+    /// Scan the given channel range for a parent with the same EPID.
+    /// Requires Milestone 2.
+    Channels {
+        channels: core::ops::Range<u8>,
+        duration: u8,
+    },
+}

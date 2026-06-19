@@ -29,6 +29,12 @@ pub trait Mlme {
         duration: u8,
     ) -> Result<ScanResult, MacError>;
 
+    /// Set the MAC operating channel and PAN context without association.
+    ///
+    /// NLME rejoin uses this after discovery to transmit a secured NWK
+    /// RejoinRequest on the candidate parent's channel.
+    fn set_channel(&mut self, channel: u8, pan_id: ShortAddress) -> Result<(), MacError>;
+
     async fn associate(
         &mut self,
         channel: u8,
@@ -57,6 +63,33 @@ pub trait Mlme {
     /// sequence number, addressing) and appends `payload` as the MAC
     /// service data unit.
     async fn transmit_data(&mut self, dest: Address, payload: &[u8]) -> Result<(), MacError>;
+
+    /// MLME-SYNC.request (IEEE 802.15.4 §7.1.14.1).
+    ///
+    /// Tunes the radio to the channel and PAN of the device's current parent
+    /// and enters receive mode.  When `track_beacon` is true the radio stays
+    /// in beacon-tracking mode (rx_when_idle); when false it performs a
+    /// one-shot sync.
+    fn sync(&mut self, request: MlmeSyncRequest) -> Result<(), MacError>;
+
+    /// MLME-RESET.request (IEEE 802.15.4 §7.1.9.1).
+    ///
+    /// When `set_default_pib` is true resets the MAC PIB to defaults,
+    /// discarding PAN, short-address, and channel state.  When false
+    /// only transient state (pending frames, sequence counters) is cleared
+    /// while PAN/address config is preserved.
+    fn reset(&mut self, set_default_pib: bool) -> Result<(), MacError>;
+}
+
+/// MLME-SYNC.request parameters (IEEE 802.15.4 §7.1.14.1).
+pub struct MlmeSyncRequest {
+    /// Logical channel to tune to before listening.
+    pub logical_channel: u8,
+    /// PAN identifier to filter on.
+    pub pan_id: ShortAddress,
+    /// If true, remain in beacon-tracking / rx-when-idle mode after sync.
+    /// If false, perform a one-shot beacon poll.
+    pub track_beacon: bool,
 }
 
 #[derive(Debug)]
