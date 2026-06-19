@@ -1,0 +1,5 @@
+error: conflicting `profile` for endpoint 1: 0x0105 vs 0x0104 (first defined above)
+ --> tests/ui/derive_device/conflicting_endpoint_metadata.rs:9:25
+  |
+9 |     #[zcl(endpoint = 1, profile = 0x0105, device = 0x0302, version = 0)]
+  |                         ^^^^^^^

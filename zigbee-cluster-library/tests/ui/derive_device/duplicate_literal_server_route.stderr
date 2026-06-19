@@ -1,0 +1,5 @@
+error: duplicate server route on endpoint 1; first route is on field `a`
+  --> tests/ui/derive_device/duplicate_literal_server_route.rs:30:25
+   |
+30 |     #[zcl(endpoint = 1, cluster = 0xfc00, manufacturer = 0x1234)]
+   |                         ^^^^^^^

@@ -1,0 +1,5 @@
+error: `manufacturer` requires a server route
+ --> tests/ui/derive_device/manufacturer_without_route.rs:5:11
+  |
+5 |     #[zcl(manufacturer = 0x1234)]
+  |           ^^^^^^^^^^^^

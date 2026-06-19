@@ -1,0 +1,11 @@
+error: first use of endpoint 1 requires `profile = <u16>`
+ --> tests/ui/derive_device/missing_endpoint_metadata.rs:6:11
+  |
+6 |     #[zcl(endpoint = 1)]
+  |           ^^^^^^^^
+
+error: first use of endpoint 1 requires `device = <u16>`
+ --> tests/ui/derive_device/missing_endpoint_metadata.rs:6:11
+  |
+6 |     #[zcl(endpoint = 1)]
+  |           ^^^^^^^^

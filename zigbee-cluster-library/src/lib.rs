@@ -45,6 +45,11 @@ macro_rules! bad_input {
 #[macro_use]
 mod macros;
 
+#[cfg(test)]
+use trybuild as _;
+#[cfg(feature = "derive")]
+pub use zigbee_device_macros::ZigbeeDevice;
+
 pub(crate) mod attribute_store;
 pub mod cluster_server;
 pub mod common;

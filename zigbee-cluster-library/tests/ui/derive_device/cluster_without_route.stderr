@@ -1,0 +1,5 @@
+error: `cluster` requires a server route
+ --> tests/ui/derive_device/cluster_without_route.rs:5:11
+  |
+5 |     #[zcl(cluster = 0xfc00)]
+  |           ^^^^^^^

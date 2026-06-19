@@ -1,0 +1,10 @@
+[package]
+name = "derive-renamed-dependency-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+zcl = { package = "zigbee-cluster-library", path = "../..", features = ["derive"] }

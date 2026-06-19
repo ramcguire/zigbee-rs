@@ -1,0 +1,6 @@
+error: `server` requires `endpoint = N`
+ --> tests/ui/derive_device/server_without_endpoint.rs:6:5
+  |
+6 | /     #[zcl(server)]
+7 | |     basic: BasicServer,
+  | |______________________^
