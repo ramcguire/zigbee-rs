@@ -2,7 +2,11 @@
 //!
 //! See Section 5.2.1 and 5.2.9
 
+use heapless::Vec;
+use zigbee::aps::apsde::MAX_ASDU_LENGTH;
 use zigbee::nwk::nlme::management::NetworkDescriptor;
+use zigbee::zdp::device_annce::DeviceAnnce;
+use zigbee_types::ShortAddress;
 
 /// Commissioning modes
 ///
@@ -54,6 +58,39 @@ pub enum BdbCommissioningStatus {
     /// A commissioning procedure was forbidden since the node was currently on
     /// a network.
     OnANetwork,
+}
+
+/// Opaque ZDO response payload capacity. APSDE limits one un-fragmented ASDU to
+/// this length, and ZDP response events store at most the response bytes after
+/// the transaction sequence number.
+pub const ZDO_RESPONSE_PAYLOAD_CAPACITY: usize = MAX_ASDU_LENGTH;
+
+/// Event emitted by [`crate::BaseDeviceBehavior::poll_once`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BdbEvent {
+    /// Device is on a network.
+    Joined,
+    /// Network key or link key material was installed.
+    TransportKeyInstalled,
+    /// Device_annce received on ZDO endpoint 0.
+    DeviceAnnounced(DeviceAnnce),
+    /// ZDO discovery response received. `payload` excludes the transaction
+    /// sequence number, which is exposed separately as `sequence`.
+    ZdoResponse {
+        source: ShortAddress,
+        cluster_id: u16,
+        sequence: u8,
+        payload: Vec<u8, ZDO_RESPONSE_PAYLOAD_CAPACITY>,
+    },
+    /// A ZCL frame was dispatched to the application device.
+    ZclHandled {
+        source: ShortAddress,
+        endpoint: u8,
+        cluster_id: u16,
+        response_sent: bool,
+    },
+    /// Frame was valid enough to receive, but not handled by this BDB path.
+    UnsupportedFrame,
 }
 
 /// Events emitted during the network finding/joining process.
