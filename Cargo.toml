@@ -25,6 +25,7 @@ ccm = { version = "0.5.0", default-features = false }
 aead = { version = "0.5.0", default-features = false }
 itertools = { version = "0.14.0", default-features = false }
 embedded-storage = "0.3.1"
+embedded-io = "0.6"
 heapless = "0.9.1"
 log = "0.4"
 mockall = "0.13"

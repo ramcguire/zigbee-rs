@@ -44,9 +44,13 @@ macro_rules! bad_input {
     };
 }
 
+#[macro_use]
+mod macros;
+
 pub(crate) mod attribute_store;
 pub mod cluster_server;
 pub mod common;
+pub mod reporting;
 pub mod types;
 
 /// General ZCL Frame
