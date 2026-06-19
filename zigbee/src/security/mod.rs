@@ -133,13 +133,21 @@ impl<'a> SecurityContext<'a> {
             .iter_mut()
             .find(|k| k.key_seq_number == key_sequence_number)
             .ok_or(SecurityError::Unspecified)?;
-        let frame_counter = sec_material.outgoing_frame_counter;
+        let frame_counter = sec_material
+            .outgoing_frame_counter
+            .max(self.nib.outgoing_frame_counter());
         let local_addr = self.nib.ieee_address();
         let key = sec_material.key;
 
-        // increment outgoing frame counter (§4.3.1.1)
-        sec_material.outgoing_frame_counter += 1;
+        // increment outgoing frame counter (§4.3.1.1) and mirror it in the
+        // NIB so permanent leave can clear key material without permitting a
+        // future key install to restart the counter.
+        let next_frame_counter = frame_counter
+            .checked_add(1)
+            .ok_or(SecurityError::InvalidData)?;
+        sec_material.outgoing_frame_counter = next_frame_counter;
         self.nib.set_security_material_set(sec_material_set);
+        self.nib.set_outgoing_frame_counter(next_frame_counter);
 
         let mut security_control = SecurityControl::default();
         security_control.set_security_level(sec_level);
@@ -197,11 +205,11 @@ impl<'a> SecurityContext<'a> {
         let (nwk_hdr, _) = NwkHeader::try_read(hdr_buf, ())?;
         if !nwk_hdr.frame_control.security_flag() {
             // no security enabled for frame, exit with payload
-            return Ok(Self::nwk_frame_from_payload(
+            return Self::nwk_frame_from_payload(
                 nwk_hdr,
                 &frame_buffer[nwk_hdr_len..],
                 nwk_hdr_len,
-            )?);
+            );
         }
 
         let (mut aux_hdr, aux_hdr_len) =
@@ -509,6 +517,11 @@ impl<'a> SecurityContext<'a> {
 
         // step 4
         if aux_hdr.frame_counter < key_config.incoming_frame_counter {
+            log::debug!(
+                "[SEC] APS frame counter replay: got={} expected>={}",
+                aux_hdr.frame_counter,
+                key_config.incoming_frame_counter
+            );
             return Err(SecurityError::Unspecified);
         }
 
@@ -1059,6 +1072,59 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_nwk_frame_rejects_replay() {
+        let nib = setup_nib();
+        let aib = setup_aib();
+        let security_context = SecurityContext::new(&nib, &aib);
+
+        // First decrypt succeeds and updates the incoming frame counter.
+        let mut buf1 = NWK_FRAME_CMD_BUFFER;
+        security_context
+            .decrypt_nwk_frame_in_place(&mut buf1)
+            .expect("first decrypt must succeed");
+
+        // Same encrypted frame replayed must be rejected.
+        let mut buf2 = NWK_FRAME_CMD_BUFFER;
+        let result = security_context.decrypt_nwk_frame_in_place(&mut buf2);
+        assert!(
+            matches!(result, Err(SecurityError::InvalidData)),
+            "replay must be rejected, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn decrypt_aps_frame_rejects_replay() {
+        let nib = setup_nib();
+        let aib = setup_aib();
+        let security_context = SecurityContext::new(&nib, &aib);
+
+        // aps data frame with frame counter = 4 (same bytes as decrypt_aps_frame_data).
+        let frame_buffer: [u8; 21] = [
+            0x21, 0x66, // aps header
+            0x20, 0x4, 0x0, 0x0, 0x0, 0xe5, 0x1, 0x30, 0x38, 0x9c, 0x38, 0xc1,
+            0xa4, // aux header
+            0x1a, 0x31, // enc data
+            0xa4, 0xd7, 0xf4, 0xd7, // mic
+        ];
+
+        // First decrypt succeeds and updates the incoming frame counter to 5.
+        let mut buf1 = frame_buffer;
+        security_context
+            .decrypt_aps_frame_in_place(&mut buf1)
+            .expect("first decrypt must succeed");
+
+        // Same encrypted frame replayed must be rejected (counter 4 < stored 5).
+        let mut buf2 = frame_buffer;
+        let result = security_context.decrypt_aps_frame_in_place(&mut buf2);
+        assert!(
+            matches!(result, Err(SecurityError::Unspecified)),
+            "replay must be rejected, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
     fn decrypt_unsecured_nwk_data_frame() {
         let nib = setup_nib();
         let aib = setup_aib();
@@ -1082,7 +1148,7 @@ mod tests {
             .unwrap();
 
         let NwkFrame::Data(data_frame) = frame else {
-            panic!("expected data frame");
+            unreachable!("expected data frame");
         };
 
         // payload should be the APS bytes, not the entire buffer
