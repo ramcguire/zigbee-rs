@@ -128,6 +128,52 @@ pub struct PanDescriptor {
     pub zigbee_beacon: ZigbeeBeacon,
 }
 
+impl PanDescriptor {
+    /// Construct a `PanDescriptor` representing a beacon from a coordinator
+    /// or router.  Sets router and end-device capacity flags to `true` and
+    /// depth to `0`.  Intended for use in unit tests and host-side tooling.
+    pub fn new(
+        channel: u8,
+        pan_id: u16,
+        short_addr: u16,
+        association_permit: bool,
+        extended_pan_id: zigbee_types::IeeeAddress,
+        link_quality: u8,
+    ) -> Self {
+        use ieee802154::mac::beacon::BeaconOrder;
+        use ieee802154::mac::beacon::SuperframeOrder;
+
+        Self {
+            channel,
+            coord_addr_mode: 0x02,
+            coord_pan_id: ShortAddress(pan_id),
+            coord_address: Address::Short(
+                ieee802154::mac::PanId(pan_id),
+                ieee802154::mac::ShortAddress(short_addr),
+            ),
+            superframe_spec: SuperframeSpecification {
+                beacon_order: BeaconOrder::OnDemand,
+                superframe_order: SuperframeOrder::Inactive,
+                final_cap_slot: 15,
+                battery_life_extension: false,
+                pan_coordinator: short_addr == 0x0000,
+                association_permit,
+            },
+            link_quality,
+            security_use: false,
+            zigbee_beacon: ZigbeeBeacon {
+                protocol_id: 0,
+                stack_profile: StackProfile(0)
+                    .set_router_capacity(true)
+                    .set_end_device_capacity(true),
+                extended_pan_id,
+                tx_offset: zigbee_types::ByteArray([0u8; 3]),
+                update_id: 0,
+            },
+        }
+    }
+}
+
 impl_byte! {
     #[derive(Debug)]
     pub struct ZigbeeBeacon {
