@@ -43,8 +43,6 @@ use crate::aps::types::TxOptions;
 use crate::nwk::frame::Frame as NwkFrame;
 use crate::nwk::frame::header::Header as NwkHeader;
 use crate::nwk::nib;
-use crate::nwk::nib::IncomingFrameCounterDescriptor;
-use crate::nwk::nib::NetworkSecurityMaterialDescriptor;
 use crate::nwk::nib::Nib;
 use crate::nwk::nib::NibStorage;
 use crate::security::frame::KeyIdentifier;
@@ -199,9 +197,10 @@ impl<'a> SecurityContext<'a> {
         let (nwk_hdr, _) = NwkHeader::try_read(hdr_buf, ())?;
         if !nwk_hdr.frame_control.security_flag() {
             // no security enabled for frame, exit with payload
-            return Ok(NwkFrame::from_payload(
+            return Ok(Self::nwk_frame_from_payload(
                 nwk_hdr,
                 &frame_buffer[nwk_hdr_len..],
+                nwk_hdr_len,
             )?);
         }
 
@@ -213,30 +212,28 @@ impl<'a> SecurityContext<'a> {
         }
 
         // 2) select the key from NIB
-        let sec_material = self.nib.security_material_set();
-        let sec_material = sec_material
+        let mut sec_material_set = self.nib.security_material_set();
+        let sec_material_index = sec_material_set
             .iter()
-            .find(|k| {
+            .position(|k| {
                 aux_hdr
                     .key_sequence_number
                     .is_some_and(|ksn| ksn == k.key_seq_number)
             })
             .ok_or(SecurityError::Unspecified)?;
-        let key = sec_material.key.as_slice();
+        let key = sec_material_set[sec_material_index].key;
+        let key = key.as_slice();
 
-        // 3) anti-replay: reject unless the frame counter is strictly greater
-        // than the last accepted one for this sender. Using `<=` means a replay
-        // of the most-recently-accepted counter is rejected too, not just older
-        // ones.
+        // 3) check the incoming frame counter against the next accepted value.
         let Some(source_address) = aux_hdr.source_address else {
             return Err(SecurityError::InvalidData);
         };
-        if sec_material
+        if sec_material_set[sec_material_index]
             .incoming_frame_counter_set
             .iter()
             .find(|i| source_address == i.sender_address)
             .is_some_and(|inc_frame_counter| {
-                aux_hdr.frame_counter <= inc_frame_counter.incoming_frame_counter
+                aux_hdr.frame_counter < inc_frame_counter.incoming_frame_counter
             })
         {
             return Err(SecurityError::InvalidData);
@@ -259,21 +256,39 @@ impl<'a> SecurityContext<'a> {
             .decrypt_in_place_detached(&nonce, aad, enc_data, tag)
             .map_err(SecurityError::CcmError)?;
 
-        // 4) anti-replay tracking: now that the frame is authenticated, record
-        // its frame counter as the most recent accepted value for this sender,
-        // so a later replay of this (or an older) counter is rejected by the
-        // check above. Persisted through the NIB's interior mutability.
-        let mut sec_material_set = self.nib.security_material_set();
-        if let Some(material) = sec_material_set.iter_mut().find(|k| {
-            aux_hdr
-                .key_sequence_number
-                .is_some_and(|ksn| ksn == k.key_seq_number)
-        }) {
-            record_nwk_incoming_frame_counter(material, source_address, aux_hdr.frame_counter)?;
-            self.nib.set_security_material_set(sec_material_set);
+        let next_counter = aux_hdr
+            .frame_counter
+            .checked_add(1)
+            .ok_or(SecurityError::InvalidData)?;
+        let counters = &mut sec_material_set[sec_material_index].incoming_frame_counter_set;
+        if let Some(counter) = counters
+            .iter_mut()
+            .find(|counter| counter.sender_address == source_address)
+        {
+            counter.incoming_frame_counter = next_counter;
+        } else {
+            counters
+                .push(nib::IncomingFrameCounterDescriptor {
+                    sender_address: source_address,
+                    incoming_frame_counter: next_counter,
+                })
+                .map_err(|_| SecurityError::Unspecified)?;
         }
+        self.nib.set_security_material_set(sec_material_set);
 
-        Ok(NwkFrame::from_payload(nwk_hdr, enc_data)?)
+        Self::nwk_frame_from_payload(nwk_hdr, enc_data, nwk_hdr_len + aux_hdr_len)
+    }
+
+    fn nwk_frame_from_payload<'b>(
+        nwk_hdr: NwkHeader<'b>,
+        payload: &'b [u8],
+        payload_offset: usize,
+    ) -> Result<NwkFrame<'b>, SecurityError> {
+        let mut frame = NwkFrame::from_payload(nwk_hdr, payload)?;
+        if let NwkFrame::Data(data) = &mut frame {
+            data.payload_offset = payload_offset;
+        }
+        Ok(frame)
     }
 
     pub fn encrypt_aps_frame_in_place(
@@ -344,9 +359,7 @@ impl<'a> SecurityContext<'a> {
         security_control.set_security_level(sec_level);
         security_control.set_key_identifier(key_id);
 
-        if matches!(aps_frame, ApsFrame::ApsCommand(_))
-            || matches!(tx_options, TxOptions::IncludeExtendedNonce)
-        {
+        if matches!(aps_frame, ApsFrame::ApsCommand(_)) || tx_options.include_extended_nonce() {
             security_control.set_extended_nonce(true);
         }
 
@@ -467,12 +480,6 @@ impl<'a> SecurityContext<'a> {
         // TODO: the spec says "using the source address in the APS frame as the index"
         // but the APS frame does not have a source field, only the security header
         let mut key_set = self.aib.device_key_pair_set();
-        // Whether a frame has already been accepted from this device. Only a
-        // known device carries a meaningful `incoming_frame_counter`; the first
-        // frame seen establishes it. This is the "seen-yet" sentinel that keeps
-        // a legitimate first frame (whose counter may be 0, the field's initial
-        // value) from being rejected by the anti-replay check below.
-        let known_device = key_set.iter().any(|k| k.device_address == source_address);
         let key_config = key_set.find_or_insert_with_mut(
             |k| k.device_address == source_address,
             // TODO: what do we set here if the source device is new and unknown?
@@ -500,12 +507,8 @@ impl<'a> SecurityContext<'a> {
             KeyIdentifier::Network => return Err(SecurityError::InvalidData),
         };
 
-        // step 4 - anti-replay. Applies to every link-key type, including the
-        // global trust-center key, not just UniqueLinkKey - global-key devices
-        // need replay protection too. Enforced only once a frame has previously
-        // been accepted from this device. `<=` rejects a replay of the
-        // most-recently-accepted counter as well, not just older ones.
-        if known_device && aux_hdr.frame_counter <= key_config.incoming_frame_counter {
+        // step 4
+        if aux_hdr.frame_counter < key_config.incoming_frame_counter {
             return Err(SecurityError::Unspecified);
         }
 
@@ -531,40 +534,13 @@ impl<'a> SecurityContext<'a> {
             .decrypt_in_place_detached(&nonce, aad, enc_data, tag)
             .map_err(SecurityError::CcmError)?;
 
-        // anti-replay tracking: now that the frame is authenticated, record its
-        // frame counter as the most recent accepted value for this device and
-        // persist it through the AIB's interior mutability, so a later replay of
-        // this (or an older) counter is rejected by the check above.
-        key_config.incoming_frame_counter = aux_hdr.frame_counter;
+        key_config.incoming_frame_counter = aux_hdr
+            .frame_counter
+            .checked_add(1)
+            .ok_or(SecurityError::InvalidData)?;
         self.aib.set_device_key_pair_set(key_set);
 
         Ok(ApsFrame::from_payload(aps_hdr, enc_data)?)
-    }
-}
-
-/// Records `frame_counter` as the most recently accepted incoming counter for
-/// `sender_address`, inserting a new entry when this is the first frame seen
-/// from that sender. Used by the NWK decrypt path for anti-replay tracking.
-fn record_nwk_incoming_frame_counter(
-    material: &mut NetworkSecurityMaterialDescriptor,
-    sender_address: IeeeAddress,
-    frame_counter: u32,
-) -> Result<(), SecurityError> {
-    if let Some(entry) = material
-        .incoming_frame_counter_set
-        .iter_mut()
-        .find(|i| i.sender_address == sender_address)
-    {
-        entry.incoming_frame_counter = frame_counter;
-        Ok(())
-    } else {
-        material
-            .incoming_frame_counter_set
-            .push(IncomingFrameCounterDescriptor {
-                sender_address,
-                incoming_frame_counter: frame_counter,
-            })
-            .map_err(|_| SecurityError::Unspecified)
     }
 }
 
@@ -700,7 +676,7 @@ mod tests {
         let mut got_buffer = [0u8; 21];
 
         let offset = security_context
-            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(offset, frame_buffer.len());
@@ -782,7 +758,7 @@ mod tests {
 
         let mut got_buffer = [0u8; 54];
         let offset = security_context
-            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(offset, frame_buffer.len());
@@ -826,7 +802,7 @@ mod tests {
 
         let mut got_buffer = [0u8; 128];
         let offset = security_context
-            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut got_buffer, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(offset, frame_buffer.len());
@@ -1057,6 +1033,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(nib.security_material_set()[0].outgoing_frame_counter, 2);
+        let mut sec = nib.security_material_set();
+        sec[0].incoming_frame_counter_set.clear();
+        nib.set_security_material_set(sec);
 
         // The first decrypt recorded the sender's frame counter, so replaying
         // the same captured frame would now be rejected. This test only
@@ -1144,7 +1123,7 @@ mod tests {
             .decrypt_aps_frame_in_place(&mut dec_buf)
             .unwrap();
         security_context
-            .encrypt_aps_frame_in_place(frame, &mut buf, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut buf, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(
@@ -1156,23 +1135,18 @@ mod tests {
             1
         );
 
-        // The first decrypt recorded the device's frame counter, so replaying
-        // the same captured frame would now be rejected. This test only
-        // exercises the outgoing counter, so reset the incoming counter to
-        // reuse the fixture for a second encrypt.
         let mut key_set = aib.device_key_pair_set();
-        if let Some(k) = key_set.iter_mut().find(|k| k.device_address == dest) {
-            k.incoming_frame_counter = 0;
+        for entry in key_set.iter_mut() {
+            entry.incoming_frame_counter = 0;
         }
         aib.set_device_key_pair_set(key_set);
-
         // second encryption — counter should be 2
         let mut dec_buf = frame_buffer;
         let frame = security_context
             .decrypt_aps_frame_in_place(&mut dec_buf)
             .unwrap();
         security_context
-            .encrypt_aps_frame_in_place(frame, &mut buf, dest, TxOptions::SecurityEnabled)
+            .encrypt_aps_frame_in_place(frame, &mut buf, dest, TxOptions::SECURITY_ENABLED)
             .unwrap();
 
         assert_eq!(

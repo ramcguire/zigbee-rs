@@ -4,6 +4,7 @@ pub mod frame_control;
 pub mod header;
 
 use core::mem;
+use core::ops::Range;
 use core::slice;
 
 use byte::BytesExt;
@@ -35,7 +36,11 @@ impl<'a> Frame<'a> {
     pub fn from_payload(header: Header<'a>, payload: &'a [u8]) -> byte::Result<Self> {
         match header.frame_control.frame_type() {
             FrameType::Data => {
-                let data_frame = DataFrame { header, payload };
+                let data_frame = DataFrame {
+                    header,
+                    payload,
+                    payload_offset: 0,
+                };
                 Ok(Frame::Data(data_frame))
             }
             FrameType::NwkCommand => {
@@ -78,14 +83,12 @@ impl<'a> TryWrite<SecurityContext<'a>> for Frame<'a> {
 pub struct DataFrame<'a> {
     pub header: Header<'a>,
     pub payload: &'a [u8],
+    pub payload_offset: usize,
 }
 
-impl<'a> DataFrame<'a> {
-    /// # Safety
-    ///
-    /// Ensure that the buffer referenced by `self` is mutable locally.
-    pub(crate) unsafe fn payload_as_mut(&mut self) -> &'a mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.payload.as_ptr().cast_mut(), self.payload.len()) }
+impl DataFrame<'_> {
+    pub(crate) fn payload_range(&self) -> Range<usize> {
+        self.payload_offset..self.payload_offset + self.payload.len()
     }
 }
 

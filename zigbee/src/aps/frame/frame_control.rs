@@ -62,6 +62,12 @@ impl FrameControl {
         ((self.0 & mask::ACK_FLAG) >> offset::ACK_FLAG) != 0
     }
 
+    #[must_use]
+    pub fn set_ack_request(mut self, value: bool) -> Self {
+        self.0 = (self.0 & !mask::ACK_FLAG) | ((value as u8) << offset::ACK_FLAG);
+        self
+    }
+
     // specifies whether the extended header shall be included  in the frame.
     // If this sub-field is set to 1, then the extended header shall be included in
     // the frame. Otherwise, it shall not  be included in the frame.
@@ -121,7 +127,7 @@ pub enum DeliveryMode {
     Unicast = 0b00,
     Reserved = 0b01,
     Broadcast = 0b10,
-    GroubAddressing = 0b11,
+    GroupAddressing = 0b11,
 }
 
 impl_byte! {
