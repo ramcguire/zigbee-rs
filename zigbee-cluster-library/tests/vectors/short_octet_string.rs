@@ -7,4 +7,6 @@ pub static ROUNDTRIP: &[(&[u8], &[u8])] = &[
     (&[0x04, 0xDE, 0xAD, 0xBE, 0xEF], b"\xDE\xAD\xBE\xEF"),
 ];
 
-pub static NULL_WIRE: &[&[u8]] = &[&[0xFF]];
+pub static NULL_WIRE: &[&[u8]] = &[
+    &[0xFF],
+];

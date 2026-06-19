@@ -7,7 +7,11 @@ pub static ROUNDTRIP: &[(&[u8], &[u8])] = &[
     (&[0x20, 0x03, 0x00, 0x01, 0x64, 0xFE], &[1u8, 100u8, 254u8]),
 ];
 
-pub static NULL_WIRE: &[&[u8]] = &[&[0x20, 0xFF, 0xFF]];
+pub static NULL_WIRE: &[&[u8]] = &[
+    &[0x20, 0xFF, 0xFF],
+];
 
 /// Must return Err(ZclError::TypeIdMismatch) — element_type byte is wrong.
-pub static TYPE_MISMATCH: &[&[u8]] = &[&[0x21, 0x01, 0x00, 0x00]];
+pub static TYPE_MISMATCH: &[&[u8]] = &[
+    &[0x21, 0x01, 0x00, 0x00],
+];

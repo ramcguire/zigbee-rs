@@ -25,8 +25,13 @@ import importlib.metadata
 import struct
 import sys
 from pathlib import Path
+from typing import Any
 
 import zigpy.types as t
+import zigpy.zcl.clusters.general as zcl_general
+import zigpy.zcl.clusters.homeautomation as zcl_homeautomation
+import zigpy.zcl.clusters.measurement as zcl_measurement
+import zigpy.zcl.clusters.hvac as zcl_hvac
 
 ZIGPY_VERSION = importlib.metadata.version("zigpy")
 
@@ -559,6 +564,416 @@ def gen_struct_with_array() -> str:
     return assemble(rt, fmt_bytes_list("NULL_WIRE", [null_wire]))
 
 
+# ---------------------------------------------------------------------------
+# Cluster vector helpers
+# ---------------------------------------------------------------------------
+
+class _FakeEndpoint:
+    """Minimal stub so zigpy cluster attribute lookups work without a live device."""
+    def __init__(self):
+        self.device = None
+
+
+def _cluster(cls):
+    """Instantiate a zigpy cluster without a real endpoint."""
+    try:
+        return cls(endpoint=None, is_server=True)
+    except Exception:
+        return cls(_FakeEndpoint(), is_server=True)
+
+
+def zcl_frame(frame_control: int, seq: int, cmd_id: int, payload: bytes) -> bytes:
+    """Build a minimal 3-byte ZCL header + payload.
+
+    Common frame_control values:
+      0x00  global, client→server (requests)
+      0x01  cluster-specific, client→server (commands)
+      0x18  global, server→client (responses)
+      0x19  cluster-specific, server→client
+    """
+    return bytes([frame_control, seq, cmd_id]) + payload
+
+
+def read_attrs_request(attr_ids: list[int], seq: int = 1) -> bytes:
+    """ZCL ReadAttributes request frame."""
+    payload = b"".join(struct.pack("<H", a) for a in attr_ids)
+    return zcl_frame(0x00, seq, 0x00, payload)
+
+
+def read_attrs_response(cluster_cls, attr_values: dict[int, Any], seq: int = 1) -> bytes:
+    """ZCL ReadAttributesResponse frame built from zigpy cluster schema.
+
+    attr_values maps attribute_id → python value.  zigpy resolves the ZCL
+    type tag and serializes the value; we wrap it in a ReadAttributeRecord.
+    """
+    cluster = _cluster(cluster_cls)
+    records = b""
+    for attr_id, value in attr_values.items():
+        attr_def = cluster.attributes[attr_id]
+        zcl_type = attr_def.type
+        type_id_byte = int(attr_def.zcl_type)
+        encoded_value = zcl_type(value).serialize()
+        # ReadAttributeRecord: [attr_id u16 LE, status u8, type_id u8, value...]
+        records += struct.pack("<HB", attr_id, 0x00) + bytes([type_id_byte]) + encoded_value
+    return zcl_frame(0x18, seq, 0x01, records)
+
+
+def write_attrs_request(cluster_cls, writes: dict[int, Any], seq: int = 1) -> bytes:
+    """ZCL WriteAttributes request frame."""
+    cluster = _cluster(cluster_cls)
+    records = b""
+    for attr_id, value in writes.items():
+        attr_def = cluster.attributes[attr_id]
+        zcl_type = attr_def.type
+        type_id_byte = int(attr_def.zcl_type)
+        encoded_value = zcl_type(value).serialize()
+        # WriteAttributeRecord: [attr_id u16 LE, type_id u8, value...]
+        records += struct.pack("<H", attr_id) + bytes([type_id_byte]) + encoded_value
+    return zcl_frame(0x00, seq, 0x02, records)
+
+
+def write_attrs_response_success(seq: int = 1) -> bytes:
+    """ZCL WriteAttributesResponse with a single global Success status."""
+    return zcl_frame(0x18, seq, 0x04, bytes([0x00]))
+
+
+def write_attrs_response_error(attr_id: int, status: int, seq: int = 1) -> bytes:
+    """ZCL WriteAttributesResponse with a per-attribute error record."""
+    # [status u8, attr_id u16 LE]
+    payload = bytes([status]) + struct.pack("<H", attr_id)
+    return zcl_frame(0x18, seq, 0x04, payload)
+
+
+def cluster_cmd_request(cmd_id: int, payload: bytes, seq: int = 1) -> bytes:
+    """ZCL cluster-specific command request frame (client→server)."""
+    return zcl_frame(0x01, seq, cmd_id, payload)
+
+
+def default_response(cmd_id: int, status: int, seq: int = 1) -> bytes:
+    """ZCL DefaultResponse frame (server→client)."""
+    return zcl_frame(0x18, seq, 0x0B, bytes([cmd_id, status]))
+
+
+def fmt_request_response_pairs(name: str, pairs: list[tuple[bytes, bytes]]) -> str:
+    lines = [f"    ({fmt_bytes(req)}, {fmt_bytes(resp)})," for req, resp in pairs]
+    return (
+        f"pub static {name}: &[(&[u8], &[u8])] = &[\n"
+        + "\n".join(lines)
+        + "\n];\n"
+    )
+
+
+def discover_attrs_request(start_attr_id: int = 0x0000, max_count: int = 0xFF, seq: int = 1) -> bytes:
+    """ZCL DiscoverAttributes request frame (cmd 0x0C)."""
+    return zcl_frame(0x00, seq, 0x0C, struct.pack("<HB", start_attr_id, max_count))
+
+
+def discover_attrs_response(attrs: list[tuple[int, int]], seq: int = 1) -> bytes:
+    """ZCL DiscoverAttributesResponse frame (cmd 0x0D).
+
+    attrs: list of (attr_id, type_id_byte) pairs, sorted ascending by attr_id.
+    Type IDs mirror our Rust TypeId enum: Boolean=0x10, Bitmap8=0x18, Bitmap32=0x1B,
+    Uint8=0x20, Uint16=0x21, Int8=0x28, Int16=0x29, Enum8=0x30, CharacterString=0x42.
+    Built from the Rust attribute_list() so vectors are byte-exact against our impl.
+    """
+    records = b"".join(struct.pack("<HB", attr_id, type_id) for attr_id, type_id in attrs)
+    return zcl_frame(0x18, seq, 0x0D, bytes([0x01]) + records)  # 0x01 = discovery_complete
+
+
+# Attr lists mirroring each cluster's attribute_list() in Rust.
+# Must be kept in sync with the Rust implementations.
+_CLUSTER_ATTRS: dict[str, list[tuple[int, int]]] = {
+    # (attr_id, type_id_byte) — sorted ascending by attr_id
+    "on_off":        [(0x0000, 0x10), (0xFFFD, 0x21), (0x4000, 0x10),
+                      (0x4001, 0x21), (0x4002, 0x21)],
+    "level_control": [(0x0000, 0x20), (0x0001, 0x21), (0x0002, 0x20),
+                      (0x0003, 0x20), (0x000F, 0x18), (0xFFFD, 0x21)],
+    "basic":         [(0x0000, 0x20), (0x0004, 0x42), (0x0005, 0x42),
+                      (0x0007, 0x30), (0x0012, 0x10), (0xFFFD, 0x21)],
+    "temperature":   [(0x0000, 0x29), (0x0001, 0x29), (0x0002, 0x29),
+                      (0x0003, 0x21), (0xFFFD, 0x21)],
+    "humidity":      [(0x0000, 0x21), (0x0001, 0x21), (0x0002, 0x21),
+                      (0x0003, 0x21), (0xFFFD, 0x21)],
+    "pressure":      [(0x0000, 0x29), (0x0001, 0x29), (0x0002, 0x29),
+                      (0x0003, 0x21), (0xFFFD, 0x21)],
+    "flow":          [(0x0000, 0x21), (0x0001, 0x21), (0x0002, 0x21),
+                      (0x0003, 0x21), (0xFFFD, 0x21)],
+    "illuminance":   [(0x0000, 0x21), (0x0001, 0x21), (0x0002, 0x21),
+                      (0x0003, 0x21), (0x0004, 0x30), (0xFFFD, 0x21)],
+    "occupancy":     [(0x0000, 0x18), (0x0001, 0x30), (0x0002, 0x18),
+                      (0xFFFD, 0x21)],
+    "electrical":    [(0x0000, 0x1B), (0x0505, 0x21), (0x0508, 0x21),
+                      (0x050B, 0x29), (0x0510, 0x28), (0xFFFD, 0x21)],
+    "thermostat":    [(0x0000, 0x29), (0x0011, 0x29), (0x0012, 0x29),
+                      (0x001B, 0x30), (0x001C, 0x30), (0xFFFD, 0x21)],
+}
+
+
+def _discover_cases(cluster_key: str, seq: int = 1) -> list[tuple[bytes, bytes]]:
+    attrs = _CLUSTER_ATTRS[cluster_key]
+    return [(discover_attrs_request(seq=seq), discover_attrs_response(attrs, seq=seq))]
+
+
+# ---------------------------------------------------------------------------
+# Cluster generators
+# ---------------------------------------------------------------------------
+
+def gen_cluster_on_off() -> str:
+    SEQ = 1
+    # ReadAttributes: read attr 0x0000 (OnOff) with on_off=false, then on_off=true
+    read_pairs = [
+        (
+            read_attrs_request([0x0000], SEQ),
+            read_attrs_response(zcl_general.OnOff, {0x0000: False}, SEQ),
+        ),
+        (
+            read_attrs_request([0x0000], SEQ),
+            read_attrs_response(zcl_general.OnOff, {0x0000: True}, SEQ),
+        ),
+    ]
+    # Cluster-specific commands: Off=0x00, On=0x01, Toggle=0x02
+    cmd_pairs = [
+        (cluster_cmd_request(cmd_id, b"", SEQ), default_response(cmd_id, 0x00, SEQ))
+        for cmd_id in [0x00, 0x01, 0x02]
+    ]
+    write_pairs = [
+        (write_attrs_request(zcl_general.OnOff, {0x0000: False}, SEQ),
+         write_attrs_response_error(0x0000, 0x88, SEQ)),
+    ]
+    return assemble(
+        fmt_request_response_pairs("READ_CASES", read_pairs),
+        fmt_request_response_pairs("COMMAND_CASES", cmd_pairs),
+        fmt_request_response_pairs("WRITE_CASES", write_pairs),
+        fmt_request_response_pairs("DISCOVER_CASES", _discover_cases("on_off", SEQ)),
+    )
+
+
+def _gen_cluster_measurement(
+    cluster_cls,
+    measured_attr_id: int,
+    values: list[int],
+    cluster_key: str,
+    extra_read_attrs: list[tuple[int, any]] | None = None,
+    write_error_attr_id: int | None = None,
+) -> str:
+    """Shared generator for measurement clusters. Adds WRITE_CASES and DISCOVER_CASES."""
+    SEQ = 1
+    read_pairs = [
+        (
+            read_attrs_request([measured_attr_id], SEQ),
+            read_attrs_response(cluster_cls, {measured_attr_id: v}, SEQ),
+        )
+        for v in values
+    ]
+    for attr_id, val in (extra_read_attrs or []):
+        read_pairs.append((
+            read_attrs_request([attr_id], SEQ),
+            read_attrs_response(cluster_cls, {attr_id: val}, SEQ),
+        ))
+    parts = [fmt_request_response_pairs("READ_CASES", read_pairs)]
+    if write_error_attr_id is not None:
+        write_pairs = [
+            (
+                write_attrs_request(cluster_cls, {write_error_attr_id: values[0]}, SEQ),
+                write_attrs_response_error(write_error_attr_id, 0x88, SEQ),
+            )
+        ]
+        parts.append(fmt_request_response_pairs("WRITE_CASES", write_pairs))
+    parts.append(fmt_request_response_pairs("DISCOVER_CASES", _discover_cases(cluster_key, SEQ)))
+    return assemble(*parts)
+
+
+def gen_cluster_temperature() -> str:
+    # extra: min=-2000, max=8000, tolerance=100
+    return _gen_cluster_measurement(
+        zcl_measurement.TemperatureMeasurement,
+        measured_attr_id=0x0000,
+        values=[0, 2500, -1000],
+        cluster_key="temperature",
+        extra_read_attrs=[(0x0001, -2000), (0x0002, 8000), (0x0003, 100)],
+        write_error_attr_id=0x0000,
+    )
+
+
+def gen_cluster_humidity() -> str:
+    # extra: min=100, max=9000, tolerance=100
+    return _gen_cluster_measurement(
+        zcl_measurement.RelativeHumidity,
+        measured_attr_id=0x0000,
+        values=[0, 5000, 9999],
+        cluster_key="humidity",
+        extra_read_attrs=[(0x0001, 100), (0x0002, 9000), (0x0003, 100)],
+        write_error_attr_id=0x0000,
+    )
+
+
+def gen_cluster_pressure() -> str:
+    # extra: min=0, max=2000, tolerance=100
+    return _gen_cluster_measurement(
+        zcl_measurement.PressureMeasurement,
+        measured_attr_id=0x0000,
+        values=[0, 1013, -1],
+        cluster_key="pressure",
+        extra_read_attrs=[(0x0001, 0), (0x0002, 2000), (0x0003, 100)],
+        write_error_attr_id=0x0000,
+    )
+
+
+def gen_cluster_flow() -> str:
+    # extra: min=0, max=1000, tolerance=100
+    return _gen_cluster_measurement(
+        zcl_measurement.FlowMeasurement,
+        measured_attr_id=0x0000,
+        values=[0, 100, 65534],
+        cluster_key="flow",
+        extra_read_attrs=[(0x0001, 0), (0x0002, 1000), (0x0003, 100)],
+        write_error_attr_id=0x0000,
+    )
+
+
+def gen_cluster_illuminance() -> str:
+    # extra: min=10, max=60000, tolerance=100
+    return _gen_cluster_measurement(
+        zcl_measurement.IlluminanceMeasurement,
+        measured_attr_id=0x0000,
+        values=[0, 1000, 65533],
+        cluster_key="illuminance",
+        extra_read_attrs=[(0x0001, 10), (0x0002, 60000), (0x0003, 100)],
+        write_error_attr_id=0x0000,
+    )
+
+
+def gen_cluster_occupancy() -> str:
+    # zigpy OccupancySensing attr model diverges from our impl (no 0x0002, different type for 0x0001)
+    # so only 0x0000 (occupancy bitmap) is vector-tested via zigpy reference
+    return _gen_cluster_measurement(
+        zcl_measurement.OccupancySensing,
+        measured_attr_id=0x0000,
+        values=[0, 1],
+        cluster_key="occupancy",
+        write_error_attr_id=0x0000,
+    )
+
+
+def gen_cluster_level_control() -> str:
+    SEQ = 1
+    values = [0, 127, 254]
+    read_pairs = [
+        (
+            read_attrs_request([0x0000], SEQ),
+            read_attrs_response(zcl_general.LevelControl, {0x0000: v}, SEQ),
+        )
+        for v in values
+    ]
+    cmd_pairs = [
+        # MoveToLevel (0x00): level, transition=0 (instant)
+        *[
+            (cluster_cmd_request(0x00, bytes([level, 0x00, 0x00]), SEQ), default_response(0x00, 0x00, SEQ))
+            for level in values
+        ],
+        # MoveToLevelWithOnOff (0x04): same payload format
+        (cluster_cmd_request(0x04, bytes([100, 0x00, 0x00]), SEQ), default_response(0x04, 0x00, SEQ)),
+        # Move (0x01): Up, rate=50 units/s
+        (cluster_cmd_request(0x01, bytes([0x00, 50]), SEQ), default_response(0x01, 0x00, SEQ)),
+        # Step (0x02): Up, size=10, transition=0
+        (cluster_cmd_request(0x02, bytes([0x00, 10, 0x00, 0x00]), SEQ), default_response(0x02, 0x00, SEQ)),
+        # Stop (0x03): no payload
+        (cluster_cmd_request(0x03, b"", SEQ), default_response(0x03, 0x00, SEQ)),
+        # MoveWithOnOff (0x05): Up, rate=50
+        (cluster_cmd_request(0x05, bytes([0x00, 50]), SEQ), default_response(0x05, 0x00, SEQ)),
+        # StepWithOnOff (0x06): Up, size=10, transition=0
+        (cluster_cmd_request(0x06, bytes([0x00, 10, 0x00, 0x00]), SEQ), default_response(0x06, 0x00, SEQ)),
+        # StopWithOnOff (0x07): no payload
+        (cluster_cmd_request(0x07, b"", SEQ), default_response(0x07, 0x00, SEQ)),
+    ]
+    write_pairs = [
+        (write_attrs_request(zcl_general.LevelControl, {0x0000: 127}, SEQ),
+         write_attrs_response_error(0x0000, 0x88, SEQ)),
+    ]
+    return assemble(
+        fmt_request_response_pairs("READ_CASES", read_pairs),
+        fmt_request_response_pairs("COMMAND_CASES", cmd_pairs),
+        fmt_request_response_pairs("WRITE_CASES", write_pairs),
+        fmt_request_response_pairs("DISCOVER_CASES", _discover_cases("level_control", SEQ)),
+    )
+
+
+def gen_cluster_basic() -> str:
+    SEQ = 1
+    # Fixed static config: zcl_version=3, power_source=0x01, device_enabled varies.
+    read_pairs = [
+        (read_attrs_request([0x0000], SEQ), read_attrs_response(zcl_general.Basic, {0x0000: 3}, SEQ)),
+        (read_attrs_request([0x0007], SEQ), read_attrs_response(zcl_general.Basic, {0x0007: 0x01}, SEQ)),
+        (read_attrs_request([0x0012], SEQ), read_attrs_response(zcl_general.Basic, {0x0012: False}, SEQ)),
+        (read_attrs_request([0x0012], SEQ), read_attrs_response(zcl_general.Basic, {0x0012: True}, SEQ)),
+    ]
+    # Write device_enabled=True → Success; write zcl_version (read-only) → ReadOnly (0x88)
+    write_pairs = [
+        (write_attrs_request(zcl_general.Basic, {0x0012: True}, SEQ), write_attrs_response_success(SEQ)),
+        (write_attrs_request(zcl_general.Basic, {0x0000: 99}, SEQ), write_attrs_response_error(0x0000, 0x88, SEQ)),
+    ]
+    return assemble(
+        fmt_request_response_pairs("READ_CASES", read_pairs),
+        fmt_request_response_pairs("WRITE_CASES", write_pairs),
+        fmt_request_response_pairs("DISCOVER_CASES", _discover_cases("basic", SEQ)),
+    )
+
+
+def gen_cluster_electrical() -> str:
+    SEQ = 1
+    scenarios = [
+        {0x0505: 0, 0x0508: 0, 0x050B: 0},
+        {0x0505: 230, 0x0508: 1000, 0x050B: 100},
+    ]
+    read_pairs = [
+        (
+            read_attrs_request([0x0505, 0x0508, 0x050B], SEQ),
+            read_attrs_response(zcl_homeautomation.ElectricalMeasurement, attrs, SEQ),
+        )
+        for attrs in scenarios
+    ]
+    # measurement_type (0x0000, Bitmap32): SinglePhaseAC = bit 3 set (0x0000_0008)
+    read_pairs.append((
+        read_attrs_request([0x0000], SEQ),
+        read_attrs_response(zcl_homeautomation.ElectricalMeasurement, {0x0000: 0x0000_0008}, SEQ),
+    ))
+    write_pairs = [
+        (write_attrs_request(zcl_homeautomation.ElectricalMeasurement, {0x0505: 100}, SEQ),
+         write_attrs_response_error(0x0505, 0x88, SEQ)),
+    ]
+    return assemble(
+        fmt_request_response_pairs("READ_CASES", read_pairs),
+        fmt_request_response_pairs("WRITE_CASES", write_pairs),
+        fmt_request_response_pairs("DISCOVER_CASES", _discover_cases("electrical", SEQ)),
+    )
+
+
+def gen_cluster_thermostat() -> str:
+    SEQ = 1
+    # READ_CASES: local_temp=2150, cooling_setpoint=2600 (default), heating_setpoint=2000 (default)
+    read_pairs = [
+        (read_attrs_request([0x0000], SEQ), read_attrs_response(zcl_hvac.Thermostat, {0x0000: 2150}, SEQ)),
+        (read_attrs_request([0x0011], SEQ), read_attrs_response(zcl_hvac.Thermostat, {0x0011: 2600}, SEQ)),
+        (read_attrs_request([0x0012], SEQ), read_attrs_response(zcl_hvac.Thermostat, {0x0012: 2000}, SEQ)),
+    ]
+    # COMMAND_CASES: SetpointRaiseLower (0x00) — payload [mode u8, amount i8]
+    cmd_pairs = [
+        (cluster_cmd_request(0x00, bytes([0x00, 5]), SEQ), default_response(0x00, 0x00, SEQ)),       # Heat +5
+        (cluster_cmd_request(0x00, bytes([0x01, 0xFD]), SEQ), default_response(0x00, 0x00, SEQ)),    # Cool -3
+        (cluster_cmd_request(0x00, bytes([0x02, 2]), SEQ), default_response(0x00, 0x00, SEQ)),       # Both +2
+    ]
+    write_pairs = [
+        (write_attrs_request(zcl_hvac.Thermostat, {0x0011: 2400}, SEQ), write_attrs_response_success(SEQ)),
+        (write_attrs_request(zcl_hvac.Thermostat, {0x0000: 2000}, SEQ), write_attrs_response_error(0x0000, 0x88, SEQ)),
+    ]
+    return assemble(
+        fmt_request_response_pairs("READ_CASES", read_pairs),
+        fmt_request_response_pairs("COMMAND_CASES", cmd_pairs),
+        fmt_request_response_pairs("WRITE_CASES", write_pairs),
+        fmt_request_response_pairs("DISCOVER_CASES", _discover_cases("thermostat", SEQ)),
+    )
+
+
 GENERATORS: dict[str, tuple[str, callable]] = {
     # (output filename, generator function)
     "u8":                ("u8.rs",                 lambda: gen_uint(t.uint8_t,  "u8",  8)),
@@ -613,6 +1028,18 @@ GENERATORS: dict[str, tuple[str, callable]] = {
     "coll_nested_array_u8":      ("collections/array_of_array_u8.rs",  gen_nested_array_u8),
     "coll_array_of_struct_pair": ("collections/array_of_struct_pair.rs", gen_array_of_struct_pair),
     "coll_struct_with_array":    ("collections/struct_with_array.rs",   gen_struct_with_array),
+    # Cluster vectors — ZCL frame (request, response) pairs from zigpy reference impl
+    "cluster_on_off":      ("clusters/on_off.rs",      gen_cluster_on_off),
+    "cluster_temperature": ("clusters/temperature.rs", gen_cluster_temperature),
+    "cluster_humidity":    ("clusters/humidity.rs",    gen_cluster_humidity),
+    "cluster_pressure":    ("clusters/pressure.rs",    gen_cluster_pressure),
+    "cluster_flow":        ("clusters/flow.rs",        gen_cluster_flow),
+    "cluster_illuminance": ("clusters/illuminance.rs", gen_cluster_illuminance),
+    "cluster_occupancy":     ("clusters/occupancy.rs",     gen_cluster_occupancy),
+    "cluster_level_control": ("clusters/level_control.rs", gen_cluster_level_control),
+    "cluster_basic":         ("clusters/basic.rs",         gen_cluster_basic),
+    "cluster_electrical":    ("clusters/electrical.rs",    gen_cluster_electrical),
+    "cluster_thermostat":    ("clusters/thermostat.rs",    gen_cluster_thermostat),
 }
 
 def write_or_check(path: Path, content: str, check: bool) -> bool:

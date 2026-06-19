@@ -7,7 +7,11 @@ pub static ROUNDTRIP: &[(&[u8], &str)] = &[
     (&[0x05, 0x63, 0x61, 0x66, 0xC3, 0xA9], "café"),
 ];
 
-pub static NULL_WIRE: &[&[u8]] = &[&[0xFF]];
+pub static NULL_WIRE: &[&[u8]] = &[
+    &[0xFF],
+];
 
 /// Must return Err(ZclError::InvalidUtf8).
-pub static INVALID_UTF8: &[&[u8]] = &[&[0x03, 0xFF, 0xFE, 0xFD]];
+pub static INVALID_UTF8: &[&[u8]] = &[
+    &[0x03, 0xFF, 0xFE, 0xFD],
+];

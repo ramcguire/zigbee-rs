@@ -8,4 +8,6 @@ pub static ROUNDTRIP: &[(&[u8], u16)] = &[
     (&[0xFE, 0xFF], 65534u16),
 ];
 
-pub static NULL_WIRE: &[&[u8]] = &[&[0xFF, 0xFF]];
+pub static NULL_WIRE: &[&[u8]] = &[
+    &[0xFF, 0xFF],
+];
