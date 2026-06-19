@@ -12,6 +12,7 @@ members = [
     "zigbee-cluster-library",
     "zigbee-macros",
     "zigbee-types",
+    "xtask",
 ]
 exclude = [
 	"zigbee-mac"

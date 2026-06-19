@@ -5,6 +5,7 @@ docs/spec
 docs/captures
 .idea
 Cargo.lock
+__pycache__/
 
 
 # Debug and profiling cruft
