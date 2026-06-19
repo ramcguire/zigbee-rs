@@ -244,6 +244,45 @@ impl MatchDescReq {
         })
     }
 
+    /// Parse a `Match_Desc_req` payload received from the network.
+    ///
+    /// `bytes` must start immediately after the transaction sequence number
+    /// (i.e., the caller has already consumed the seq byte).
+    pub fn try_read_payload(bytes: &[u8]) -> Result<Self, byte::Error> {
+        let offset = &mut 0;
+        let nwk_addr_of_interest: ShortAddress = bytes.read_with(offset, ())?;
+        let profile_id: u16 = bytes.read_with(offset, byte::LE)?;
+
+        let num_in: u8 = bytes.read(offset)?;
+        let mut in_cluster_list = Vec::new();
+        for _ in 0..num_in {
+            let cid: u16 = bytes.read_with(offset, byte::LE)?;
+            in_cluster_list
+                .push(cid)
+                .map_err(|_| byte::Error::BadInput {
+                    err: "too many clusters",
+                })?;
+        }
+
+        let num_out: u8 = bytes.read(offset)?;
+        let mut out_cluster_list = Vec::new();
+        for _ in 0..num_out {
+            let cid: u16 = bytes.read_with(offset, byte::LE)?;
+            out_cluster_list
+                .push(cid)
+                .map_err(|_| byte::Error::BadInput {
+                    err: "too many clusters",
+                })?;
+        }
+
+        Ok(Self {
+            nwk_addr_of_interest,
+            profile_id,
+            in_cluster_list,
+            out_cluster_list,
+        })
+    }
+
     #[allow(clippy::cast_possible_truncation)] // cluster list lengths are ZDP-bounded to u8
     pub fn write_payload(&self, seq: u8, buf: &mut [u8]) -> byte::Result<usize> {
         let offset = &mut 0;

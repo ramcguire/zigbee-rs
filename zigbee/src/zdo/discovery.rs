@@ -235,6 +235,11 @@ mod tests {
                 channels: core::ops::Range<u8>,
                 duration: u8,
             ) -> Result<ScanResult, MacError>;
+            fn set_channel(
+                &mut self,
+                channel: u8,
+                pan_id: ShortAddress,
+            ) -> Result<(), MacError>;
             async fn associate(
                 &mut self,
                 channel: u8,
@@ -251,6 +256,11 @@ mod tests {
                 dest: MacAddress,
                 payload: &[u8],
             ) -> Result<(), MacError>;
+            fn sync(
+                &mut self,
+                request: zigbee_mac::mlme::MlmeSyncRequest,
+            ) -> Result<(), MacError>;
+            fn reset(&mut self, set_default_pib: bool) -> Result<(), MacError>;
         }
     }
 
@@ -280,9 +290,12 @@ mod tests {
     }
 
     fn make_nlme(mac: MockMlme) -> (std::sync::MutexGuard<'static, ()>, Nlme<MockMlme>) {
-        let guard = nib::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = nib::TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         nib::try_init(NibStorage::default());
         nib::reset();
+        nib::get_ref().set_security_material_set(StorageVec::new());
         aib::try_init(AibStorage::default());
         aib::reset();
         let nlme = Nlme::new(mac);

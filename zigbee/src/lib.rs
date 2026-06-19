@@ -8,6 +8,7 @@
 //! mechanisms.
 #![no_std]
 #![deny(clippy::panic, unused_must_use)]
+#![allow(clippy::unused_async)]
 #![warn(
     clippy::missing_safety_doc,
     //missing_docs,
@@ -48,6 +49,7 @@
     clippy::too_long_first_doc_paragraph,
     clippy::derivable_impls,
     clippy::unused_self,
+    clippy::unused_async_trait_impl,
     async_fn_in_trait
 )]
 #![feature(macro_metavar_expr_concat)]
