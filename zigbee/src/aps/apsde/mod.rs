@@ -69,7 +69,7 @@ impl Apsde {
             .frame_control
             .security_flag();
         if aps_secured {
-            drop(nwk_data);
+            let _ = nwk_data;
             // SAFETY: `payload_range` was produced by parsing `buf`, and `nwk_data`
             // is dropped before taking the mutable subslice for in-place APS decrypt.
             let aps_buf = unsafe {
@@ -83,7 +83,7 @@ impl Apsde {
             let Frame::Data(data) = aps_frame else {
                 return Err(NetworkError::InvalidFrame);
             };
-            data_frame_to_indication(source, destination, nwk_secured, data)
+            data_frame_to_indication(source, destination, nwk_secured, &data)
         } else {
             parse_data_indication_parts(source, destination, nwk_secured, nwk_data.payload)
         }
@@ -94,16 +94,15 @@ async fn data_request_status<M: Mlme>(
     nlme: &mut Nlme<M>,
     request: &ApsdeSapRequest<'_>,
 ) -> ApsdeSapConfirmStatus {
-    if request.asdu.len() > MAX_ASDU_LENGTH {
-        return ApsdeSapConfirmStatus::AsduTooLong;
-    }
-
-    if request.tx_options.fragmentation_permitted() || request.use_alias {
+    if request.use_alias {
         return ApsdeSapConfirmStatus::UnsupportedFeature;
     }
 
     let result = match (request.dst_addr_mode, request.dst_address) {
         (DstAddrMode::Network, Address::Network(destination)) if is_broadcast(destination) => {
+            if request.asdu.len() > MAX_ASDU_LENGTH {
+                return ApsdeSapConfirmStatus::AsduTooLong;
+            }
             apsme
                 .broadcast_data(
                     nlme,
@@ -117,21 +116,54 @@ async fn data_request_status<M: Mlme>(
                 .await
         }
         (DstAddrMode::Network, Address::Network(destination)) => {
+            if request.asdu.len() > MAX_ASDU_LENGTH {
+                if !request.tx_options.fragmentation_permitted() {
+                    return ApsdeSapConfirmStatus::AsduTooLong;
+                }
+                apsme
+                    .fragment_data(
+                        nlme,
+                        ShortAddress(destination),
+                        request.dst_endpoint,
+                        request.cluster_id,
+                        request.profile_id,
+                        request.src_endpoint.value(),
+                        request.asdu,
+                        request.tx_options,
+                    )
+                    .await
+            } else {
+                apsme
+                    .unicast_data(
+                        nlme,
+                        ShortAddress(destination),
+                        request.dst_endpoint,
+                        request.cluster_id,
+                        request.profile_id,
+                        request.src_endpoint.value(),
+                        request.asdu,
+                        request.tx_options,
+                    )
+                    .await
+            }
+        }
+        (DstAddrMode::Group, Address::Group(group_id)) => {
+            if request.asdu.len() > MAX_ASDU_LENGTH {
+                return ApsdeSapConfirmStatus::AsduTooLong;
+            }
             apsme
-                .unicast_data(
+                .multicast_data(
                     nlme,
-                    ShortAddress(destination),
-                    request.dst_endpoint,
+                    group_id,
                     request.cluster_id,
                     request.profile_id,
                     request.src_endpoint.value(),
                     request.asdu,
-                    request.tx_options,
                 )
                 .await
         }
         (DstAddrMode::None, Address::None) => return ApsdeSapConfirmStatus::NoBoundDevice,
-        (DstAddrMode::Group, Address::Group(_)) | (DstAddrMode::Extended, Address::Extended(_)) => {
+        (DstAddrMode::Extended, Address::Extended(_)) => {
             return ApsdeSapConfirmStatus::UnsupportedFeature;
         }
         _ => return ApsdeSapConfirmStatus::InvalidParameter,
@@ -139,7 +171,9 @@ async fn data_request_status<M: Mlme>(
 
     match result {
         Ok(()) => ApsdeSapConfirmStatus::Success,
-        Err(NetworkError::NotJoined) => ApsdeSapConfirmStatus::NoShortAddress,
+        Err(NetworkError::NotJoined | NetworkError::LeaveRequested { .. }) => {
+            ApsdeSapConfirmStatus::NoShortAddress
+        }
         Err(NetworkError::MacError(zigbee_mac::mlme::MacError::NoAck)) => {
             ApsdeSapConfirmStatus::NoAck
         }
@@ -170,12 +204,12 @@ pub(crate) fn parse_data_indication<'a>(
     )
 }
 
-pub(crate) fn parse_data_indication_parts<'a>(
+pub(crate) fn parse_data_indication_parts(
     source: ShortAddress,
     destination: ShortAddress,
     nwk_secured: bool,
-    payload: &'a [u8],
-) -> Result<ApsdeSapIndication<'a>, NetworkError> {
+    payload: &[u8],
+) -> Result<ApsdeSapIndication<'_>, NetworkError> {
     let (header, header_len) = Header::try_read(payload, ())?;
     if header.frame_control.frame_type() != FrameType::Data {
         return Err(NetworkError::InvalidFrame);
@@ -186,14 +220,14 @@ pub(crate) fn parse_data_indication_parts<'a>(
         return Err(NetworkError::InvalidFrame);
     };
 
-    data_frame_to_indication(source, destination, nwk_secured, data)
+    data_frame_to_indication(source, destination, nwk_secured, &data)
 }
 
 pub(crate) fn data_frame_to_indication<'a>(
     source: ShortAddress,
     destination: ShortAddress,
     nwk_secured: bool,
-    data: super::frame::DataFrame<'a>,
+    data: &super::frame::DataFrame<'a>,
 ) -> Result<ApsdeSapIndication<'a>, NetworkError> {
     let delivery = match data.header.frame_control.delivery_mode() {
         DeliveryMode::Unicast => ApsDeliveryMode::Unicast,
@@ -438,6 +472,11 @@ mod tests {
                 channels: core::ops::Range<u8>,
                 duration: u8,
             ) -> Result<ScanResult, MacError>;
+            fn set_channel(
+                &mut self,
+                channel: u8,
+                pan_id: ShortAddress,
+            ) -> Result<(), MacError>;
             async fn associate(
                 &mut self,
                 channel: u8,
@@ -454,6 +493,11 @@ mod tests {
                 dest: MacAddress,
                 payload: &[u8],
             ) -> Result<(), MacError>;
+            fn sync(
+                &mut self,
+                request: zigbee_mac::mlme::MlmeSyncRequest,
+            ) -> Result<(), MacError>;
+            fn reset(&mut self, set_default_pib: bool) -> Result<(), MacError>;
         }
     }
 
@@ -483,7 +527,9 @@ mod tests {
     }
 
     fn make_nlme(mac: MockMlme) -> (std::sync::MutexGuard<'static, ()>, Nlme<MockMlme>) {
-        let guard = nib::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = nib::TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         nib::try_init(NibStorage::default());
         nib::reset();
         aib::try_init(AibStorage::default());
@@ -491,6 +537,7 @@ mod tests {
         let nlme = Nlme::new(mac);
         nlme.nib().set_network_address(0x5678);
         nlme.nib().set_panid(0xabcd);
+        nlme.nib().set_security_material_set(StorageVec::new());
         let mut neighbors = StorageVec::new();
         neighbors.push(make_parent()).unwrap();
         nlme.nib().set_neighbor_table(neighbors);
@@ -517,6 +564,45 @@ mod tests {
             .returning(|_, _| Ok(()));
 
         let (_guard, mut nlme) = make_nlme(mac);
+        let mut apsme = Apsme::new();
+        let request = ApsdeSapRequest::new_unicast(
+            ShortAddress(0x1234),
+            0x0b,
+            0x0104,
+            0x0006,
+            SrcEndpoint::new(0x01).unwrap(),
+            &[0xaa, 0xbb],
+        );
+
+        let confirm = block_on(Apsde::data_request(&mut apsme, &mut nlme, request));
+
+        assert_eq!(confirm.status, ApsdeSapConfirmStatus::Success);
+    }
+
+    #[test]
+    fn data_request_uses_nwk_security_after_network_key_install() {
+        let mut mac = MockMlme::new();
+        mac.expect_transmit_data()
+            .withf(|_, payload| {
+                let (header, _) = NwkHeader::try_read(payload, ()).unwrap();
+                header.frame_control.security_flag()
+            })
+            .returning(|_, _| Ok(()));
+
+        let (_guard, mut nlme) = make_nlme(mac);
+        let mut security = StorageVec::new();
+        security
+            .push(nib::NetworkSecurityMaterialDescriptor {
+                key_seq_number: 0,
+                outgoing_frame_counter: 0,
+                incoming_frame_counter_set: StorageVec::new(),
+                key: zigbee_types::ByteArray([0xAB; 16]),
+                network_key_type: 0x01,
+            })
+            .unwrap();
+        nlme.nib().set_security_material_set(security);
+        nlme.nib().set_active_key_seq_number(0);
+
         let mut apsme = Apsme::new();
         let request = ApsdeSapRequest::new_unicast(
             ShortAddress(0x1234),
@@ -583,6 +669,17 @@ mod tests {
 
     #[test]
     fn data_request_ack_option_sets_ack_request_and_transmits() {
+        // NWK-wrapped APS ACK: unsecured NWK data frame, APS frame_type=Acknowledgement
+        // (0x02), counter=1 (the counter of the first unicast_data frame sent).
+        // NWK dest = 0x5678 (device addr from make_nlme), src = 0x0000 (coordinator).
+        const NWK_APS_ACK: &[u8] = &[
+            0x08, 0x00, // NWK frame control (data, unsecured)
+            0x78, 0x56, // NWK destination (device)
+            0x00, 0x00, // NWK source (coordinator)
+            0x1e, 0x01, // radius, sequence number
+            0x02, // APS frame control: frame_type=Acknowledgement
+            0x01, // APS counter = 1
+        ];
         let mut mac = MockMlme::new();
         mac.expect_transmit_data()
             .withf(|_, payload| {
@@ -590,6 +687,14 @@ mod tests {
                     == [0x40, 0x0b, 0x06, 0x00, 0x04, 0x01, 0x01, 0x01, 0xaa]
             })
             .returning(|_, _| Ok(()));
+        mac.expect_poll_data()
+            .withf(|coord_address, _| {
+                *coord_address == MacAddress::Short(PanId(0xabcd), MacShortAddress(0x0000))
+            })
+            .returning(|_, buf| {
+                buf[..NWK_APS_ACK.len()].copy_from_slice(NWK_APS_ACK);
+                Ok((NWK_APS_ACK.len(), 200))
+            });
         let (_guard, mut nlme) = make_nlme(mac);
         let mut apsme = Apsme::new();
         let mut request = ApsdeSapRequest::new_unicast(
