@@ -84,6 +84,230 @@ impl<'a> ZclValueRef<'a> {
         decode_with_type_at(type_id, bytes, 0)
     }
 
+    /// Returns the ZCL `TypeId` for this value.
+    pub fn type_id(&self) -> TypeId {
+        match self {
+            Self::NoData => TypeId::NoData,
+            Self::Bool(_) => TypeId::Boolean,
+            Self::Uint8(_) => TypeId::Uint8,
+            Self::Uint16(_) => TypeId::Uint16,
+            Self::Uint24(_) => TypeId::Uint24,
+            Self::Uint32(_) => TypeId::Uint32,
+            Self::Uint40(_) => TypeId::Uint40,
+            Self::Uint48(_) => TypeId::Uint48,
+            Self::Uint56(_) => TypeId::Uint56,
+            Self::Uint64(_) => TypeId::Uint64,
+            Self::Int8(_) => TypeId::Int8,
+            Self::Int16(_) => TypeId::Int16,
+            Self::Int24(_) => TypeId::Int24,
+            Self::Int32(_) => TypeId::Int32,
+            Self::Int40(_) => TypeId::Int40,
+            Self::Int48(_) => TypeId::Int48,
+            Self::Int56(_) => TypeId::Int56,
+            Self::Int64(_) => TypeId::Int64,
+            Self::Data8(_) => TypeId::Data8,
+            Self::Data16(_) => TypeId::Data16,
+            Self::Data32(_) => TypeId::Data32,
+            Self::Data64(_) => TypeId::Data64,
+            Self::Bitmap8(_) => TypeId::Bitmap8,
+            Self::Bitmap16(_) => TypeId::Bitmap16,
+            Self::Bitmap32(_) => TypeId::Bitmap32,
+            Self::Bitmap64(_) => TypeId::Bitmap64,
+            Self::Enum8(_) => TypeId::Enum8,
+            Self::Enum16(_) => TypeId::Enum16,
+            Self::SemiFloat(_) => TypeId::SemiPrecision,
+            Self::Float(_) => TypeId::SinglePrecision,
+            Self::Double(_) => TypeId::DoublePrecision,
+            Self::ShortText(_) => TypeId::CharacterString,
+            Self::LongText(_) => TypeId::LongCharacterString,
+            Self::ShortOctets(_) => TypeId::OctetString,
+            Self::LongOctets(_) => TypeId::LongOctetString,
+            Self::Array(_) => TypeId::Array,
+            Self::Set(_) => TypeId::Set,
+            Self::Bag(_) => TypeId::Bag,
+            Self::Structure(_) => TypeId::Structure,
+            Self::TimeOfDay(_) => TypeId::TimeOfDay,
+            Self::Date(_) => TypeId::Date,
+            Self::UtcTime(_) => TypeId::UtcTime,
+            Self::ClusterId(_) => TypeId::ClusterId,
+            Self::AttributeId(_) => TypeId::AttributeId,
+            Self::BacnetOid(_) => TypeId::BacnetOid,
+            Self::IeeeAddress(_) => TypeId::IeeeAddress,
+            Self::SecurityKey(_) => TypeId::SecurityKey,
+            Self::RawFixed(type_id, _) => *type_id,
+        }
+    }
+
+    /// Returns the encoded byte count for this value (not including the type-id
+    /// byte).
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Self::NoData => 0,
+            Self::Bool(_)
+            | Self::Uint8(_)
+            | Self::Int8(_)
+            | Self::Data8(_)
+            | Self::Bitmap8(_)
+            | Self::Enum8(_)
+            | Self::ShortText(None)
+            | Self::ShortOctets(None) => 1,
+            Self::Uint16(_)
+            | Self::Int16(_)
+            | Self::Data16(_)
+            | Self::Bitmap16(_)
+            | Self::Enum16(_)
+            | Self::SemiFloat(_)
+            | Self::ClusterId(_)
+            | Self::AttributeId(_)
+            | Self::LongText(None)
+            | Self::LongOctets(None)
+            | Self::Structure(MaybeStructRef::Null) => 2,
+            Self::Uint24(_)
+            | Self::Int24(_)
+            | Self::Array(MaybeCollectionRef::Null { .. })
+            | Self::Set(MaybeCollectionRef::Null { .. })
+            | Self::Bag(MaybeCollectionRef::Null { .. }) => 3,
+            Self::Uint32(_)
+            | Self::Int32(_)
+            | Self::Data32(_)
+            | Self::Bitmap32(_)
+            | Self::Float(_)
+            | Self::TimeOfDay(_)
+            | Self::Date(_)
+            | Self::UtcTime(_)
+            | Self::BacnetOid(_) => 4,
+            Self::Uint40(_) | Self::Int40(_) => 5,
+            Self::Uint48(_) | Self::Int48(_) => 6,
+            Self::Uint56(_) | Self::Int56(_) => 7,
+            Self::Uint64(_)
+            | Self::Int64(_)
+            | Self::Data64(_)
+            | Self::Bitmap64(_)
+            | Self::Double(_)
+            | Self::IeeeAddress(_) => 8,
+            Self::SecurityKey(_) => 16,
+            Self::ShortText(Some(t)) => 1 + t.as_bytes().len(),
+            Self::ShortOctets(Some(b)) => 1 + b.len(),
+            Self::LongText(Some(t)) => 2 + t.as_bytes().len(),
+            Self::LongOctets(Some(b)) => 2 + b.len(),
+            Self::Array(MaybeCollectionRef::Some(c))
+            | Self::Set(MaybeCollectionRef::Some(c))
+            | Self::Bag(MaybeCollectionRef::Some(c)) => 3 + c.payload().len(),
+            Self::Structure(MaybeStructRef::Some(s)) => 2 + s.payload().len(),
+            Self::RawFixed(_, bytes) => bytes.len(),
+        }
+    }
+
+    /// Encodes this value into `buf`, writing only the value bytes (not the
+    /// type-id byte). Returns the number of bytes written.
+    #[allow(clippy::too_many_lines)]
+    pub fn encode(&self, buf: &mut [u8]) -> Result<usize, ZclError> {
+        #[inline]
+        fn copy(buf: &mut [u8], src: &[u8]) -> Result<usize, ZclError> {
+            let n = src.len();
+            buf.get_mut(..n)
+                .ok_or(ZclError::BufferTooSmall)?
+                .copy_from_slice(src);
+            Ok(n)
+        }
+        match self {
+            Self::NoData => Ok(0),
+            Self::Bool(v) => copy(buf, &[u8::from(*v)]),
+            Self::Uint8(v) | Self::Data8(v) | Self::Bitmap8(v) | Self::Enum8(v) => copy(buf, &[*v]),
+            Self::Int8(v) => copy(buf, &[v.cast_unsigned()]),
+            Self::Uint16(v)
+            | Self::Data16(v)
+            | Self::Bitmap16(v)
+            | Self::Enum16(v)
+            | Self::SemiFloat(v) => copy(buf, &v.to_le_bytes()),
+            Self::Int16(v) => copy(buf, &v.to_le_bytes()),
+            Self::Uint24(v) => copy(buf, &v.to_le_bytes()[..3]),
+            Self::Int24(v) => copy(buf, &v.to_le_bytes()[..3]),
+            Self::Uint32(v) | Self::Data32(v) | Self::Bitmap32(v) => copy(buf, &v.to_le_bytes()),
+            Self::Int32(v) => copy(buf, &v.to_le_bytes()),
+            Self::Float(v) => copy(buf, &v.to_bits().to_le_bytes()),
+            Self::TimeOfDay(v) => copy(buf, &v.0.to_le_bytes()),
+            Self::Date(v) => copy(buf, &v.0.to_le_bytes()),
+            Self::UtcTime(v) => copy(buf, &v.0.to_le_bytes()),
+            Self::BacnetOid(v) => copy(buf, &v.0.to_le_bytes()),
+            Self::Uint40(v) => copy(buf, &v.to_le_bytes()[..5]),
+            Self::Int40(v) => copy(buf, &v.to_le_bytes()[..5]),
+            Self::Uint48(v) => copy(buf, &v.to_le_bytes()[..6]),
+            Self::Int48(v) => copy(buf, &v.to_le_bytes()[..6]),
+            Self::Uint56(v) => copy(buf, &v.to_le_bytes()[..7]),
+            Self::Int56(v) => copy(buf, &v.to_le_bytes()[..7]),
+            Self::Uint64(v) | Self::Data64(v) | Self::Bitmap64(v) => copy(buf, &v.to_le_bytes()),
+            Self::Int64(v) => copy(buf, &v.to_le_bytes()),
+            Self::Double(v) => copy(buf, &v.to_bits().to_le_bytes()),
+            Self::IeeeAddress(v) => copy(buf, &v.0.to_le_bytes()),
+            Self::SecurityKey(k) => copy(buf, &k.0),
+            Self::ClusterId(c) => copy(buf, &c.0.to_le_bytes()),
+            Self::AttributeId(a) => copy(buf, &a.0.to_le_bytes()),
+            Self::ShortText(None) | Self::ShortOctets(None) => copy(buf, &[0xFF]),
+            Self::ShortText(Some(t)) => {
+                let bytes = t.as_bytes();
+                let len = u8::try_from(bytes.len()).map_err(|_| ZclError::InvalidLength)?;
+                let n = 1 + bytes.len();
+                let dst = buf.get_mut(..n).ok_or(ZclError::BufferTooSmall)?;
+                dst[0] = len;
+                dst[1..].copy_from_slice(bytes);
+                Ok(n)
+            }
+            Self::ShortOctets(Some(b)) => {
+                let len = u8::try_from(b.len()).map_err(|_| ZclError::InvalidLength)?;
+                let n = 1 + b.len();
+                let dst = buf.get_mut(..n).ok_or(ZclError::BufferTooSmall)?;
+                dst[0] = len;
+                dst[1..].copy_from_slice(b);
+                Ok(n)
+            }
+            Self::LongText(None) | Self::LongOctets(None) => copy(buf, &[0xFF, 0xFF]),
+            Self::LongText(Some(t)) => {
+                let bytes = t.as_bytes();
+                let len = u16::try_from(bytes.len()).map_err(|_| ZclError::InvalidLength)?;
+                let n = 2 + bytes.len();
+                let dst = buf.get_mut(..n).ok_or(ZclError::BufferTooSmall)?;
+                dst[..2].copy_from_slice(&len.to_le_bytes());
+                dst[2..].copy_from_slice(bytes);
+                Ok(n)
+            }
+            Self::LongOctets(Some(b)) => {
+                let len = u16::try_from(b.len()).map_err(|_| ZclError::InvalidLength)?;
+                let n = 2 + b.len();
+                let dst = buf.get_mut(..n).ok_or(ZclError::BufferTooSmall)?;
+                dst[..2].copy_from_slice(&len.to_le_bytes());
+                dst[2..].copy_from_slice(b);
+                Ok(n)
+            }
+            Self::Array(v) | Self::Set(v) | Self::Bag(v) => match v {
+                MaybeCollectionRef::Null { element_type, .. } => {
+                    copy(buf, &[element_type.raw(), 0xFF, 0xFF])
+                }
+                MaybeCollectionRef::Some(c) => {
+                    let payload = c.payload();
+                    let n = 3 + payload.len();
+                    let dst = buf.get_mut(..n).ok_or(ZclError::BufferTooSmall)?;
+                    dst[0] = c.element_type().raw();
+                    dst[1..3].copy_from_slice(&c.element_count().to_le_bytes());
+                    dst[3..].copy_from_slice(payload);
+                    Ok(n)
+                }
+            },
+            Self::Structure(v) => match v {
+                MaybeStructRef::Null => copy(buf, &[0xFF, 0xFF]),
+                MaybeStructRef::Some(s) => {
+                    let payload = s.payload();
+                    let n = 2 + payload.len();
+                    let dst = buf.get_mut(..n).ok_or(ZclError::BufferTooSmall)?;
+                    dst[..2].copy_from_slice(&s.len().to_le_bytes());
+                    dst[2..].copy_from_slice(payload);
+                    Ok(n)
+                }
+            },
+            Self::RawFixed(_, bytes) => copy(buf, bytes),
+        }
+    }
+
     fn collection(kind: CollectionKind, value: MaybeCollectionRef<'a>) -> Self {
         match kind {
             CollectionKind::Array => Self::Array(value),

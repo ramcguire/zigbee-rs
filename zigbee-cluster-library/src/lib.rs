@@ -42,6 +42,8 @@ macro_rules! bad_input {
     };
 }
 
+pub(crate) mod attribute_store;
+pub mod cluster_server;
 pub mod common;
 pub mod types;
 

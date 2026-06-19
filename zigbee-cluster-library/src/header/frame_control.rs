@@ -36,7 +36,7 @@ impl FrameControl {
     /// a manufacturer specific extension.
     ///
     /// If this value is set to 1, the manufacturer code field SHALL be present
-    /// in the ``ZclFrame``.
+    /// in the ZCL header.
     ///
     /// See Section 2.4.1.1.2
     pub fn is_manufacturer_specific(self) -> bool {
