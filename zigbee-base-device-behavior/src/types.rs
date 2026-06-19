@@ -89,6 +89,11 @@ pub enum BdbEvent {
         cluster_id: u16,
         response_sent: bool,
     },
+    /// Network requested that this device leave.
+    Left { rejoin: bool },
+    /// Device successfully rejoined after a Leave(rejoin=true) request.
+    /// The new short address is stored in the NIB.
+    Rejoined,
     /// Frame was valid enough to receive, but not handled by this BDB path.
     UnsupportedFrame,
 }
