@@ -13,10 +13,13 @@ use crate::aps::aib;
 use crate::aps::aib::DeviceKeyPairDescriptor;
 use crate::aps::aib::KeyAttribute;
 use crate::aps::aib::LinkKeyType;
+use crate::aps::apsde::ApsDeliveryMode;
 use crate::aps::apsde::Apsde;
 use crate::aps::apsde::ApsdeSapConfirmStatus;
 use crate::aps::apsde::ApsdeSapIndication;
+use crate::aps::apsde::ApsdeSapIndicationStatus;
 use crate::aps::apsde::ApsdeSapRequest;
+use crate::aps::apsde::SecurityStatus;
 use crate::aps::apsde::data_frame_to_indication;
 use crate::aps::apsde::parse_data_indication_parts;
 use crate::aps::apsme::Apsme;
@@ -24,8 +27,13 @@ use crate::aps::frame::CommandFrame;
 use crate::aps::frame::Frame;
 use crate::aps::frame::command::Command;
 use crate::aps::frame::command::TransportKey;
+use crate::aps::frame::frame_control::DeliveryMode;
+use crate::aps::frame::frame_control::Fragmentation;
 use crate::aps::frame::frame_control::FrameType;
 use crate::aps::frame::header::Header;
+use crate::aps::types::Address;
+use crate::aps::types::DstAddrMode;
+use crate::aps::types::SrcAddrMode;
 use crate::aps::types::SrcEndpoint;
 use crate::nwk::nib;
 use crate::nwk::nib::NetworkSecurityMaterialDescriptor;
@@ -51,6 +59,14 @@ pub struct ZigBeeNetwork {}
 pub enum ZigbeeDevicePoll<'a> {
     Data(ApsdeSapIndication<'a>),
     Command(Command),
+    /// Received an APS ACK frame — informational, no application action needed.
+    Ack,
+    /// Received an APS data fragment; more fragments expected.
+    FragmentDeferred,
+    /// All fragments of an APS fragmented transmission have been received.
+    /// Call [`ZigbeeDevice::take_defrag_indication`] to retrieve the assembled
+    /// ASDU.
+    FragmentComplete,
 }
 
 impl ZigbeeDevice {
@@ -163,7 +179,7 @@ impl ZigbeeDevice {
         device_annce::broadcast(nlme, &mut self.apsme, zdp_seq, annce).await
     }
 
-    /// Send an unfragmented APS data frame through this device's APSDE state.
+    /// Send an un-fragmented APS data frame through this device's APSDE state.
     pub async fn send_aps_data<M: zigbee_mac::mlme::Mlme>(
         &mut self,
         nlme: &mut Nlme<M>,
@@ -201,6 +217,7 @@ impl ZigbeeDevice {
 
     /// Poll one APS frame without losing command/data frames to the wrong
     /// parser.
+    #[allow(clippy::too_many_lines)]
     pub async fn poll_aps<'a, M: zigbee_mac::mlme::Mlme>(
         &mut self,
         nlme: &mut Nlme<M>,
@@ -208,24 +225,74 @@ impl ZigbeeDevice {
         retries: u8,
     ) -> Result<ZigbeeDevicePoll<'a>, NetworkError> {
         let buf_ptr = buf.as_mut_ptr();
-        let nwk_data = nlme.poll_nwk_data(buf, retries).await?;
-        let payload_range = nwk_data.payload_range();
-        let source = nwk_data.header.source;
-        let destination = nwk_data.header.destination;
-        let nwk_secured = nwk_data.header.frame_control.security_flag();
-        let (header, _) = Header::try_read(nwk_data.payload, ())?;
-        match header.frame_control.frame_type() {
+
+        // Drain any frame staged during wait_for_ack before polling for new data.
+        let (source, destination, nwk_secured, aps_start, aps_len) =
+            if let Some(pending) = self.apsme.pending_rx.take() {
+                let len = pending.len.min(buf.len());
+                buf[..len].copy_from_slice(&pending.buf[..len]);
+                (
+                    pending.source,
+                    pending.destination,
+                    pending.nwk_secured,
+                    0usize,
+                    len,
+                )
+            } else {
+                let nwk_data = nlme.poll_nwk_data(buf, retries).await?;
+                let payload_range = nwk_data.payload_range();
+                let src = nwk_data.header.source;
+                let dst = nwk_data.header.destination;
+                let sec = nwk_data.header.frame_control.security_flag();
+                let start = payload_range.start;
+                let len = payload_range.len();
+                let _ = nwk_data;
+                (src, dst, sec, start, len)
+            };
+
+        // Parse just the APS frame type and security flag from a scoped shared
+        // reference so the borrow ends before any in-place mutation below.
+        // Also extract all extended-header fields needed for the unsecured path
+        // so that we never need to re-borrow buf after this block.
+        let (frame_type, aps_secured_flag, hdr_len, counter, ack_request, delivery_mode, ext_frag) = {
+            // SAFETY: all borrows into buf ended above (nwk_data dropped;
+            // pending_rx copy completed). buf_ptr was captured before any borrow.
+            let frame_ro: &[u8] =
+                unsafe { core::slice::from_raw_parts(buf_ptr.add(aps_start), aps_len) };
+            let (header, h) = Header::try_read(frame_ro, ())?;
+            let ft = header.frame_control.frame_type();
+            let sec = header.frame_control.security_flag();
+            let ctr = header.counter;
+            let ack = header.frame_control.ack_request();
+            let dm = header.frame_control.delivery_mode();
+            let ext: Option<(u8, u8, Fragmentation, u8, u8, u16, u16)> =
+                header.extended_header.as_ref().and_then(|ext| {
+                    if ext.extended_frame_control.is_fragmented() {
+                        Some((
+                            ext.block_number.unwrap_or(0),
+                            ext.ack_bitfield.unwrap_or(0),
+                            ext.extended_frame_control.fragmentation(),
+                            header.destination_endpoint.unwrap_or(0),
+                            header.source_endpoint.unwrap_or(0),
+                            header.cluster_id.unwrap_or(0),
+                            header.profile_id.unwrap_or(0),
+                        ))
+                    } else {
+                        None
+                    }
+                });
+            (ft, sec, h, ctr, ack, dm, ext)
+            // frame_ro and header dropped here — no active borrows on buf
+        };
+
+        match frame_type {
             FrameType::Data => {
-                if header.frame_control.security_flag() {
-                    drop(nwk_data);
-                    // SAFETY: `payload_range` was produced by parsing `buf`, and
-                    // `nwk_data` is dropped before in-place APS decrypt.
-                    let aps_buf = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            buf_ptr.add(payload_range.start),
-                            payload_range.len(),
-                        )
-                    };
+                if aps_secured_flag {
+                    // SAFETY: scoped block above dropped all shared borrows into buf.
+                    // buf_ptr was captured before any borrow and points into memory
+                    // valid for 'a.
+                    let aps_buf =
+                        unsafe { core::slice::from_raw_parts_mut(buf_ptr.add(aps_start), aps_len) };
                     let frame = SecurityContext::get().decrypt_aps_frame_in_place(aps_buf)?;
                     let Frame::Data(data) = frame else {
                         return Err(NetworkError::InvalidFrame);
@@ -238,42 +305,144 @@ impl ZigbeeDevice {
                     ) {
                         return Err(NetworkError::InvalidFrame);
                     }
+
+                    if data.header.frame_control.ack_request()
+                        && data.header.frame_control.delivery_mode() == DeliveryMode::Unicast
+                    {
+                        let _ = self.apsme.send_ack(nlme, source, data.header.counter).await;
+                    }
+
+                    // Fragment reassembly path (APS-secured).
+                    if let Some(ref ext_hdr) = data.header.extended_header
+                        && ext_hdr.extended_frame_control.is_fragmented()
+                    {
+                        let block_number = ext_hdr.block_number.unwrap_or(0);
+                        let ack_bitfield = ext_hdr.ack_bitfield.unwrap_or(0);
+                        let fragmentation = ext_hdr.extended_frame_control.fragmentation();
+                        let dst_ep = data.header.destination_endpoint.unwrap_or(0);
+                        let src_ep = data.header.source_endpoint.unwrap_or(0);
+                        let cluster_id = data.header.cluster_id.unwrap_or(0);
+                        let profile_id = data.header.profile_id.unwrap_or(0);
+                        let ctr = data.header.counter;
+                        let mut frag_local = [0u8; crate::aps::apsme::MAX_FRAGMENT_PAYLOAD];
+                        let copy_len = data
+                            .payload
+                            .len()
+                            .min(crate::aps::apsme::MAX_FRAGMENT_PAYLOAD);
+                        frag_local[..copy_len].copy_from_slice(&data.payload[..copy_len]);
+                        let _ = data;
+                        let assembled = self.apsme.defrag_incoming(
+                            source,
+                            ctr,
+                            block_number,
+                            ack_bitfield,
+                            fragmentation,
+                            dst_ep,
+                            src_ep,
+                            cluster_id,
+                            profile_id,
+                            nwk_secured,
+                            destination,
+                            true,
+                            &frag_local[..copy_len],
+                        );
+                        return Ok(if assembled.is_some() {
+                            ZigbeeDevicePoll::FragmentComplete
+                        } else {
+                            ZigbeeDevicePoll::FragmentDeferred
+                        });
+                    }
+
                     Ok(ZigbeeDevicePoll::Data(data_frame_to_indication(
                         source,
                         destination,
                         nwk_secured,
-                        data,
+                        &data,
                     )?))
                 } else {
                     if !self
                         .apsme
-                        .accept_incoming(source, header.counter, FrameType::Data, false)
+                        .accept_incoming(source, counter, FrameType::Data, false)
                     {
                         return Err(NetworkError::InvalidFrame);
                     }
+
+                    if ack_request && delivery_mode == DeliveryMode::Unicast {
+                        let _ = self.apsme.send_ack(nlme, source, counter).await;
+                    }
+
+                    // Fragment reassembly path (unsecured). All APS header fields
+                    // were extracted above before any borrow of buf ended, so we
+                    // can safely re-borrow a subslice for the payload copy.
+                    if let Some((
+                        block_number,
+                        ack_bitfield,
+                        fragmentation,
+                        dst_ep,
+                        src_ep,
+                        cluster_id,
+                        profile_id,
+                    )) = ext_frag
+                    {
+                        let mut frag_local = [0u8; crate::aps::apsme::MAX_FRAGMENT_PAYLOAD];
+                        let copy_len = {
+                            // SAFETY: no active borrows on buf[aps_start..] at this
+                            // point — scoped block above dropped frame_ro/header.
+                            let frag_src: &[u8] = unsafe {
+                                core::slice::from_raw_parts(
+                                    buf_ptr.add(aps_start + hdr_len),
+                                    aps_len.saturating_sub(hdr_len),
+                                )
+                            };
+                            let n = frag_src.len().min(crate::aps::apsme::MAX_FRAGMENT_PAYLOAD);
+                            frag_local[..n].copy_from_slice(&frag_src[..n]);
+                            n
+                            // frag_src borrow ends here
+                        };
+                        let assembled = self.apsme.defrag_incoming(
+                            source,
+                            counter,
+                            block_number,
+                            ack_bitfield,
+                            fragmentation,
+                            dst_ep,
+                            src_ep,
+                            cluster_id,
+                            profile_id,
+                            nwk_secured,
+                            destination,
+                            false,
+                            &frag_local[..copy_len],
+                        );
+                        return Ok(if assembled.is_some() {
+                            ZigbeeDevicePoll::FragmentComplete
+                        } else {
+                            ZigbeeDevicePoll::FragmentDeferred
+                        });
+                    }
+
+                    // Non-fragmented unsecured data. Return a slice into buf with
+                    // lifetime 'a so the caller can borrow the ASDU without copying.
+                    // SAFETY: no borrows on buf[aps_start..] exist at this point.
+                    let aps_payload: &'a [u8] =
+                        unsafe { core::slice::from_raw_parts(buf_ptr.add(aps_start), aps_len) };
                     Ok(ZigbeeDevicePoll::Data(parse_data_indication_parts(
                         source,
                         destination,
                         nwk_secured,
-                        nwk_data.payload,
+                        aps_payload,
                     )?))
                 }
             }
             FrameType::Command => {
-                if !header.frame_control.security_flag() {
+                if !aps_secured_flag {
                     return Err(NetworkError::SecurityError(
                         crate::security::SecurityError::InvalidData,
                     ));
                 }
-                drop(nwk_data);
-                // SAFETY: `payload_range` was produced by parsing `buf`, and
-                // `nwk_data` is dropped before in-place APS decrypt.
-                let aps_buf = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        buf_ptr.add(payload_range.start),
-                        payload_range.len(),
-                    )
-                };
+                // SAFETY: same as secured Data arm above.
+                let aps_buf =
+                    unsafe { core::slice::from_raw_parts_mut(buf_ptr.add(aps_start), aps_len) };
                 let frame = SecurityContext::get().decrypt_aps_frame_in_place(aps_buf)?;
                 let Frame::ApsCommand(CommandFrame { header, command }) = frame else {
                     return Err(NetworkError::InvalidFrame);
@@ -286,7 +455,8 @@ impl ZigbeeDevice {
                 }
                 Ok(ZigbeeDevicePoll::Command(command))
             }
-            FrameType::Acknowledgement | FrameType::InterPan => Err(NetworkError::InvalidFrame),
+            FrameType::Acknowledgement => Ok(ZigbeeDevicePoll::Ack),
+            FrameType::InterPan => Err(NetworkError::InvalidFrame),
         }
     }
 
@@ -296,30 +466,55 @@ impl ZigbeeDevice {
         &mut self,
         nlme: &mut Nlme<M>,
     ) -> Result<(), NetworkError> {
-        let mut buf = [0u8; 128];
-        let nwk_data = nlme.poll_nwk_data(&mut buf, 5).await?;
-        let payload_range = nwk_data.payload_range();
-        let (header, _) = Header::try_read(nwk_data.payload, ())?;
-        if header.frame_control.frame_type() != FrameType::Command
-            || !header.frame_control.security_flag()
-        {
-            return Err(NetworkError::NoTransportKey);
+        // Loop up to 5 times: each iteration polls for one MAC frame and
+        // skips non-TRANSPORT-KEY frames (NWK commands, regular APS data,
+        // decrypt failures) rather than failing immediately.  This mirrors
+        // poll_command's drain-loop approach and handles coordinators that
+        // queue NWK command frames before the NWK key delivery.
+        for _ in 0..5u8 {
+            let mut buf = [0u8; 128];
+            let nwk_data = match nlme.poll_nwk_data(&mut buf, 1).await {
+                Ok(d) => d,
+                Err(e) => {
+                    log::debug!("[ZDO] poll_transport_key: skip frame ({e:?})");
+                    continue;
+                }
+            };
+            let payload_range = nwk_data.payload_range();
+            let Ok((header, _)) = Header::try_read(nwk_data.payload, ()) else {
+                log::debug!("[ZDO] poll_transport_key: APS header parse fail");
+                continue;
+            };
+            if header.frame_control.frame_type() != FrameType::Command
+                || !header.frame_control.security_flag()
+            {
+                log::debug!(
+                    "[ZDO] poll_transport_key: skip non-cmd/unencrypted APS (type={:?})",
+                    header.frame_control.frame_type()
+                );
+                continue;
+            }
+            let _ = nwk_data;
+            let cx = SecurityContext::get();
+            let aps_frame = match cx.decrypt_aps_frame_in_place(&mut buf[payload_range]) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::debug!("[ZDO] poll_transport_key: APS decrypt fail: {e:?}");
+                    continue;
+                }
+            };
+            let Frame::ApsCommand(CommandFrame {
+                command: Command::TransportKey(transport_key),
+                ..
+            }) = aps_frame
+            else {
+                log::debug!("[ZDO] poll_transport_key: not a TRANSPORT-KEY, skipping");
+                continue;
+            };
+            install_transport_key(transport_key)?;
+            return Ok(());
         }
-        drop(nwk_data);
-        let cx = SecurityContext::get();
-        let aps_frame = cx.decrypt_aps_frame_in_place(&mut buf[payload_range])?;
-
-        let Frame::ApsCommand(CommandFrame {
-            command: Command::TransportKey(transport_key),
-            ..
-        }) = aps_frame
-        else {
-            return Err(NetworkError::NoTransportKey);
-        };
-
-        install_transport_key(transport_key)?;
-
-        Ok(())
+        Err(NetworkError::NoTransportKey)
     }
 
     /// Security Manager: build and send an APS command frame (§4.4).
@@ -338,6 +533,51 @@ impl ZigbeeDevice {
         self.apsme
             .send_command(nlme, destination, dest_ieee, command, aps_secure)
             .await
+    }
+
+    /// Borrow the completed fragment-reassembly result without copying the
+    /// ASDU.
+    ///
+    /// Call after `poll_aps` returns `ZigbeeDevicePoll::FragmentComplete`.
+    /// Returns `None` if no completed reassembly is available.
+    /// Call [`Self::clear_defrag`] once the indication has been fully
+    /// processed.
+    pub fn peek_defrag_indication(&self) -> Option<ApsdeSapIndication<'_>> {
+        let state = self.apsme.defrag_state.as_ref()?;
+        if !state.complete {
+            return None;
+        }
+        Some(ApsdeSapIndication {
+            dst_addr_mode: DstAddrMode::Network,
+            dst_address: Address::Network(state.dst_short.0),
+            dst_endpoint: state.dst_endpoint,
+            src_addr_mode: SrcAddrMode::Short,
+            src_address: Address::Network(state.source.0),
+            src_endpoint: state.src_endpoint,
+            profile_id: state.profile_id,
+            cluster_id: state.cluster_id,
+            asdu: &state.buf[..state.assembled_len],
+            delivery: ApsDeliveryMode::Unicast,
+            status: ApsdeSapIndicationStatus::Success,
+            security_status: if state.aps_secured {
+                SecurityStatus::SecuredLinkKey
+            } else if state.nwk_secured {
+                SecurityStatus::SecuredNwkKey
+            } else {
+                SecurityStatus::Unsecured
+            },
+            link_quality: 0,
+            rx_time: 0,
+        })
+    }
+
+    /// Clear the completed fragment-reassembly state.
+    ///
+    /// Call after [`Self::peek_defrag_indication`] and after the indication
+    /// has been fully dispatched, so the slot is available for the next
+    /// fragmented transmission.
+    pub fn clear_defrag(&mut self) {
+        self.apsme.defrag_state = None;
     }
 
     /// Security Manager: poll for an incoming APS command (§4.4).
