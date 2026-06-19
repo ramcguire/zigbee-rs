@@ -57,6 +57,14 @@ pub(crate) struct SplitAttributeStore<const MUT_N: usize> {
 
 impl<const MUT_N: usize> SplitAttributeStore<MUT_N> {
     pub const fn new(descriptors: &'static [AttrDescriptor], mutable: [Cell<u64>; MUT_N]) -> Self {
+        assert!(
+            is_sorted(descriptors),
+            "descriptors must be sorted ascending by attr ID"
+        );
+        assert!(
+            has_no_duplicate_keys(descriptors),
+            "descriptors must have no duplicate attr IDs"
+        );
         Self {
             descriptors,
             mutable,
@@ -72,10 +80,17 @@ impl<const MUT_N: usize> SplitAttributeStore<MUT_N> {
     /// Encode attribute `id` into `buf`. Returns `(TypeId, bytes_written)`.
     pub fn read_into(&self, id: AttributeId, buf: &mut [u8]) -> Result<(TypeId, usize), AttrError> {
         let desc = self.find_entry(id).ok_or(AttrError::UnsupportedAttribute)?;
+        if !desc.access.is_readable() {
+            return Err(AttrError::WriteOnly);
+        }
         match &desc.storage {
             StorageKind::ConstScalar(val) => encode_scalar(desc.type_id, *val, buf),
             StorageKind::MutableScalar { index } => {
-                let val = self.mutable[usize::from(*index)].get();
+                let val = self
+                    .mutable
+                    .get(usize::from(*index))
+                    .ok_or(AttrError::Codec(ZclError::InvalidValue))?
+                    .get();
                 encode_scalar(desc.type_id, val, buf)
             }
             StorageKind::StaticString(sv) => encode_static_string(desc.type_id, *sv, buf),
@@ -94,6 +109,67 @@ impl<const MUT_N: usize> SplitAttributeStore<MUT_N> {
         check_write(desc, type_id, data)
     }
 
+    /// Serialize all `MUT_N` mutable slots as little-endian u64 values.
+    /// Returns bytes written (`MUT_N * 8`), or 0 if `buf` is too small.
+    pub fn snapshot(&self, buf: &mut [u8]) -> usize {
+        let needed = MUT_N * 8;
+        if buf.len() < needed {
+            return 0;
+        }
+        for (i, cell) in self.mutable.iter().enumerate() {
+            let bytes = cell.get().to_le_bytes();
+            buf[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
+        }
+        needed
+    }
+
+    /// Restore mutable slots from a snapshot produced by `snapshot()`.
+    /// Silently ignores truncated data.
+    pub fn restore_snapshot(&self, buf: &[u8]) {
+        if buf.len() < MUT_N * 8 {
+            return;
+        }
+        for (i, cell) in self.mutable.iter().enumerate() {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&buf[i * 8..(i + 1) * 8]);
+            cell.set(u64::from_le_bytes(bytes));
+        }
+    }
+}
+
+/// Primitive-value serialization used by measurement cluster snapshots.
+pub trait MeasurementValue: Copy {
+    fn mv_size() -> usize;
+    fn mv_write_le(self, buf: &mut [u8]);
+    fn mv_read_le(buf: &[u8]) -> Self;
+}
+
+macro_rules! impl_mv {
+    ($ty:ty, $n:literal) => {
+        impl MeasurementValue for $ty {
+            fn mv_size() -> usize {
+                $n
+            }
+            fn mv_write_le(self, buf: &mut [u8]) {
+                buf[..$n].copy_from_slice(&self.to_le_bytes());
+            }
+            fn mv_read_le(buf: &[u8]) -> Self {
+                let mut b = [0u8; $n];
+                b.copy_from_slice(&buf[..$n]);
+                <$ty>::from_le_bytes(b)
+            }
+        }
+    };
+}
+
+impl_mv!(i8, 1);
+impl_mv!(u8, 1);
+impl_mv!(i16, 2);
+impl_mv!(u16, 2);
+impl_mv!(i32, 4);
+impl_mv!(u32, 4);
+
+impl<const MUT_N: usize> SplitAttributeStore<MUT_N> {
     /// Decode `data` and store into the mutable slot for `id`. Takes `&self`
     /// because `Cell<u64>` provides interior mutability.
     pub fn write_from(
@@ -112,7 +188,10 @@ impl<const MUT_N: usize> SplitAttributeStore<MUT_N> {
                     .ok_or(AttrError::Codec(ZclError::InvalidLength))?;
                 let mut raw = [0u8; 8];
                 raw[..size].copy_from_slice(&data[..size]);
-                self.mutable[usize::from(*index)].set(u64::from_le_bytes(raw));
+                self.mutable
+                    .get(usize::from(*index))
+                    .ok_or(AttrError::Codec(ZclError::InvalidValue))?
+                    .set(u64::from_le_bytes(raw));
                 Ok(())
             }
             StorageKind::ConstScalar(_) | StorageKind::StaticString(_) => Err(AttrError::ReadOnly),
@@ -245,6 +324,12 @@ mod tests {
             type_id: TypeId::Boolean,
             storage: StorageKind::MutableScalar { index: 1 },
         },
+        AttrDescriptor {
+            attr: AttributeId::new(0x0005),
+            access: AccessFlags::WRITE,
+            type_id: TypeId::Uint8,
+            storage: StorageKind::MutableScalar { index: 0 },
+        },
     ];
 
     const _: () = assert!(is_sorted(ATTRS));
@@ -297,6 +382,16 @@ mod tests {
         assert_eq!(n, 4); // 1 + 3
         assert_eq!(buf[0], 3);
         assert_eq!(&buf[1..4], b"\x01\x02\x03");
+    }
+
+    #[test]
+    fn read_write_only_attr_returns_write_only() {
+        let store = make_store();
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            store.read_into(AttributeId::new(0x0005), &mut buf),
+            Err(AttrError::WriteOnly)
+        );
     }
 
     #[test]
@@ -424,6 +519,34 @@ mod tests {
         assert_eq!(
             store.check_write_from(AttributeId::new(0x0001), TypeId::Uint16, &[0x01]),
             Err(AttrError::Codec(ZclError::InsufficientBytes))
+        );
+    }
+
+    // ── MutableScalar bounds checks ───────────────────────────────────────────
+
+    static OOB_ATTRS: &[AttrDescriptor] = &[AttrDescriptor {
+        attr: AttributeId::new(0x0010),
+        access: AccessFlags::READ_WRITE,
+        type_id: TypeId::Uint8,
+        storage: StorageKind::MutableScalar { index: 5 }, // index 5, but MUT_N=1
+    }];
+
+    #[test]
+    fn read_oob_mutable_index_returns_codec_error() {
+        let store = SplitAttributeStore::<1>::new(OOB_ATTRS, [Cell::new(0)]);
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            store.read_into(AttributeId::new(0x0010), &mut buf),
+            Err(AttrError::Codec(ZclError::InvalidValue))
+        );
+    }
+
+    #[test]
+    fn write_oob_mutable_index_returns_codec_error() {
+        let store = SplitAttributeStore::<1>::new(OOB_ATTRS, [Cell::new(0)]);
+        assert_eq!(
+            store.write_from(AttributeId::new(0x0010), TypeId::Uint8, &[0x42]),
+            Err(AttrError::Codec(ZclError::InvalidValue))
         );
     }
 
