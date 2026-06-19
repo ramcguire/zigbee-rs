@@ -1,0 +1,5 @@
+error: #[derive(ZigbeeDevice)] can only be applied to structs
+ --> tests/ui/derive_device/enum_device.rs:4:6
+  |
+4 | enum Device {
+  |      ^^^^^^

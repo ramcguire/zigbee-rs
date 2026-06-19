@@ -1,0 +1,5 @@
+error: #[derive(ZigbeeDevice)] can only be applied to structs
+ --> tests/ui/derive_device/union_device.rs:4:7
+  |
+4 | union Device {
+  |       ^^^^^^

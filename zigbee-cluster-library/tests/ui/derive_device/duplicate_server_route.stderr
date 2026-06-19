@@ -1,0 +1,11 @@
+error[E0080]: evaluation panicked: duplicate Zigbee server route
+  --> tests/ui/derive_device/duplicate_server_route.rs:25:10
+   |
+25 | #[derive(ZigbeeDevice)]
+   |          ^^^^^^^^^^^^ evaluation of `_::_` failed inside this call
+   |
+note: inside `__zcl_assert_no_duplicate_routes`
+  --> tests/ui/derive_device/duplicate_server_route.rs:25:10
+   |
+25 | #[derive(ZigbeeDevice)]
+   |          ^^^^^^^^^^^^ the failure occurred here

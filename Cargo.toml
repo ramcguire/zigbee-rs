@@ -10,6 +10,7 @@ members = [
     "zigbee",
     "zigbee-base-device-behavior",
     "zigbee-cluster-library",
+    "zigbee-device-macros",
     "zigbee-macros",
     "zigbee-types",
 ]

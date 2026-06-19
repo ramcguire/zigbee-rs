@@ -1,0 +1,5 @@
+error: #[derive(ZigbeeDevice)] does not support generic structs
+ --> tests/ui/derive_device/generic_struct.rs:5:14
+  |
+5 | struct Device<T> {
+  |              ^^^

@@ -1,0 +1,5 @@
+error: endpoint 0 is reserved for ZDO; application endpoints use ids 1–254
+ --> tests/ui/derive_device/endpoint_zero.rs:6:11
+  |
+6 |     #[zcl(endpoint = 0, profile = 0x0104, device = 0x0302)]
+  |           ^^^^^^^^

@@ -13,6 +13,7 @@ authors.workspace = true
 edition = "2024"
 
 [features]
+derive = ["dep:zigbee-device-macros"]
 
 [dependencies]
 byte.workspace = true
@@ -20,7 +21,63 @@ heapless.workspace = true
 embedded-io.workspace = true
 
 zigbee-macros = { version = "0.1.0", path = "../zigbee-macros" }
+zigbee-device-macros = { version = "0.1.0", path = "../zigbee-device-macros", optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+trybuild = "1"
+
+[[test]]
+name = "derive_device"
+path = "tests/derive_device.rs"
+required-features = ["derive"]
+
+[[test]]
+name = "derive_device_compile_fail"
+path = "tests/derive_device_compile_fail.rs"
+required-features = ["derive"]
+
+[[test]]
+name = "cluster_on_off"
+path = "tests/clusters/on_off.rs"
+
+[[test]]
+name = "cluster_temperature"
+path = "tests/clusters/temperature.rs"
+
+[[test]]
+name = "cluster_humidity"
+path = "tests/clusters/humidity.rs"
+
+[[test]]
+name = "cluster_pressure"
+path = "tests/clusters/pressure.rs"
+
+[[test]]
+name = "cluster_flow"
+path = "tests/clusters/flow.rs"
+
+[[test]]
+name = "cluster_illuminance"
+path = "tests/clusters/illuminance.rs"
+
+[[test]]
+name = "cluster_occupancy"
+path = "tests/clusters/occupancy.rs"
+
+[[test]]
+name = "cluster_level_control"
+path = "tests/clusters/level_control.rs"
+
+[[test]]
+name = "cluster_basic"
+path = "tests/clusters/basic.rs"
+
+[[test]]
+name = "cluster_electrical"
+path = "tests/clusters/electrical.rs"
+
+[[test]]
+name = "cluster_thermostat"
+path = "tests/clusters/thermostat.rs"

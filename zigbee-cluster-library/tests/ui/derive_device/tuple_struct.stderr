@@ -1,0 +1,5 @@
+error: #[derive(ZigbeeDevice)] requires a struct with named fields
+ --> tests/ui/derive_device/tuple_struct.rs:5:8
+  |
+5 | struct Device(BasicServer);
+  |        ^^^^^^
