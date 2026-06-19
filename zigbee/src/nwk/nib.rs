@@ -164,6 +164,7 @@ construct_ib! {
         security_level: SecurityLevel = SecurityLevel::EncMic32,
         security_material_set: StorageVec<NetworkSecurityMaterialDescriptor, MAX_SECURITY_KEYS>,
         active_key_seq_number: u8 = 0x00,
+        outgoing_frame_counter: u32 = 0,
         #[ctx = ()]
         #[ctx_write = ()]
         all_fresh: bool = true,
@@ -419,7 +420,9 @@ mod tests {
 
     #[test]
     fn nib_default() {
-        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         try_init(NibStorage::default());
         reset();
         let nib = get_ref();
