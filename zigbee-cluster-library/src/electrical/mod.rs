@@ -1,2 +1,2 @@
 //! Electrical Measurement
-pub mod electrical;
+pub use crate::measurement::electrical::*;

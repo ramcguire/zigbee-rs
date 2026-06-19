@@ -1,118 +1,104 @@
-//! Pressure Measurement Cluster
-//!
-//! See Section 4.5
-//!
-//! Provides an interface to pressure measurement functionality, including
-//! configuration and provision of notifications of pressure measurements.
-use core::convert::TryInto;
-
-use heapless::Vec;
-
-/// Pressure Measurement Information Attribute Set
-///
-/// See Section 4.5.2.2.1
-#[derive(Debug)]
-pub struct PressureMeasurement {
-    measured_value: i16,     // MeasuredValue in 0.1 kPa units
-    min_measured_value: i16, // MinMeasuredValue
-    max_measured_value: i16, // MaxMeasuredValue
-    tolerance: u16,          // Tolerance (optional, set to 0 if not used)
-}
-
-impl PressureMeasurement {
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn new(
-        pressure_kpa: f32,
-        min_pressure: f32,
-        max_pressure: f32,
-        tolerance: u16,
-    ) -> Result<Self, &'static str> {
-        if pressure_kpa < -3276.7 || min_pressure < -3276.7 || max_pressure < -3276.7 {
-            return Err("Pressure cannot be below -3276.7 kPa");
-        }
-        if min_pressure > max_pressure {
-            return Err("Min pressure cannot be greater than max pressure");
-        }
-        if pressure_kpa < min_pressure || pressure_kpa > max_pressure {
-            return Err("Measured pressure is out of the defined range");
-        }
-
-        let measured_value = (pressure_kpa * 10.0) as i16;
-        let min_measured_value = (min_pressure * 10.0) as i16;
-        let max_measured_value = (max_pressure * 10.0) as i16;
-
-        Ok(Self {
-            measured_value,
-            min_measured_value,
-            max_measured_value,
-            tolerance,
-        })
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8, 8> {
-        let mut bytes = Vec::new();
-        bytes
-            .extend_from_slice(&self.measured_value.to_le_bytes())
-            .unwrap();
-        bytes
-            .extend_from_slice(&self.min_measured_value.to_le_bytes())
-            .unwrap();
-        bytes
-            .extend_from_slice(&self.max_measured_value.to_le_bytes())
-            .unwrap();
-        bytes
-            .extend_from_slice(&self.tolerance.to_le_bytes())
-            .unwrap();
-        bytes
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() != 8 {
-            return Err("Invalid byte slice length");
-        }
-
-        let measured_value = i16::from_le_bytes(bytes[0..2].try_into().unwrap());
-        let min_measured_value = i16::from_le_bytes(bytes[2..4].try_into().unwrap());
-        let max_measured_value = i16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        let tolerance = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
-
-        Ok(Self {
-            measured_value,
-            min_measured_value,
-            max_measured_value,
-            tolerance,
-        })
-    }
-
-    pub fn unpack_from_iter(src: impl IntoIterator<Item = u8>) -> Option<Self> {
-        let bytes: Vec<u8, 8> = src.into_iter().collect();
-        Self::from_bytes(&bytes).ok()
-    }
-}
+define_measurement_cluster!(
+    /// ZCL Pressure Measurement cluster (0x0403).
+    ///
+    /// All attributes are read-only from ZCL; the application sets values via the
+    /// typed setters. `None` encodes as the ZCL null sentinel `0x8000`
+    /// (`i16::MIN`). Values are in units of 0.1 kPa (e.g. `1013` = 101.3 kPa).
+    PressureMeasurementServer,
+    cluster_id: 0x0403,
+    value_ty: i16,
+    attr_type_id: Int16,
+);
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::cluster_server::ClusterServer;
+    use crate::cluster_server::DispatchContext;
+    use crate::cluster_server::zcl_cluster_dispatch;
+    use crate::frame::IncomingZclFrame;
+    use crate::types::error::AttrError;
+    use crate::types::ids::AttributeId;
+    use crate::types::ids::TypeId;
+
+    fn unicast() -> DispatchContext {
+        DispatchContext::unicast(0, None)
+    }
 
     #[test]
-    fn test_pressure_measurement() {
-        let pressure_measurement =
-            PressureMeasurement::new(101.3, 50.0, 200.0, 2).expect("Initialization failed");
-        let serialized = pressure_measurement.to_bytes();
-        let deserialized =
-            PressureMeasurement::from_bytes(&serialized).expect("Deserialization failed");
-        assert_eq!(
-            pressure_measurement.measured_value,
-            deserialized.measured_value
-        );
-        assert_eq!(
-            pressure_measurement.min_measured_value,
-            deserialized.min_measured_value
-        );
-        assert_eq!(
-            pressure_measurement.max_measured_value,
-            deserialized.max_measured_value
-        );
-        assert_eq!(pressure_measurement.tolerance, deserialized.tolerance);
+    fn measured_value_null_encodes_as_sentinel() {
+        let server = PressureMeasurementServer::new();
+        let mut buf = [0u8; 4];
+        let (tid, n) = server
+            .read_attribute(AttributeId::new(0x0000), &mut buf)
+            .unwrap();
+        assert_eq!(tid, TypeId::Int16);
+        assert_eq!(n, 2);
+        assert_eq!(i16::from_le_bytes([buf[0], buf[1]]), i16::MIN);
+    }
+
+    #[test]
+    fn measured_value_encodes_correctly() {
+        let mut server = PressureMeasurementServer::new();
+        server.set_measured_value(Some(1013)).unwrap(); // 101.3 kPa
+        let mut buf = [0u8; 4];
+        let (tid, n) = server
+            .read_attribute(AttributeId::new(0x0000), &mut buf)
+            .unwrap();
+        assert_eq!(tid, TypeId::Int16);
+        assert_eq!(n, 2);
+        assert_eq!(i16::from_le_bytes([buf[0], buf[1]]), 1013i16);
+    }
+
+    #[test]
+    fn tolerance_encodes_correctly() {
+        let mut server = PressureMeasurementServer::new();
+        server.set_tolerance(5).unwrap();
+        let mut buf = [0u8; 4];
+        let (tid, n) = server
+            .read_attribute(AttributeId::new(0x0003), &mut buf)
+            .unwrap();
+        assert_eq!(tid, TypeId::Uint16);
+        assert_eq!(n, 2);
+        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 5u16);
+    }
+
+    #[test]
+    fn write_returns_read_only() {
+        let mut server = PressureMeasurementServer::new();
+        let err = server
+            .write_attribute(AttributeId::new(0x0000), TypeId::Int16, &[0x00, 0x00])
+            .unwrap_err();
+        assert!(matches!(err, AttrError::ReadOnly));
+    }
+
+    #[test]
+    fn unknown_attribute_returns_unsupported() {
+        let server = PressureMeasurementServer::new();
+        let mut buf = [0u8; 4];
+        let err = server
+            .read_attribute(AttributeId::new(0xFFFF), &mut buf)
+            .unwrap_err();
+        assert!(matches!(err, AttrError::UnsupportedAttribute));
+    }
+
+    #[test]
+    fn dispatch_read_measured_value() {
+        let req: &[u8] = &[
+            0x00, 0x01, 0x00, // global, seq=1, ReadAttributes
+            0x00, 0x00, // attr 0x0000
+        ];
+        let (frame, _) = IncomingZclFrame::decode(req).unwrap();
+        let mut buf = [0u8; 32];
+        let mut server = PressureMeasurementServer::new();
+        server.set_measured_value(Some(500)).unwrap(); // 50.0 kPa
+        let n = zcl_cluster_dispatch(&mut server, &frame, unicast(), &mut buf)
+            .unwrap()
+            .response_len;
+        // ReadAttributesResponse header (3) + attr_id (2) + status (1) + type (1) +
+        // value (2)
+        assert_eq!(n, 9);
+        assert_eq!(i16::from_le_bytes([buf[7], buf[8]]), 500i16);
     }
 }
