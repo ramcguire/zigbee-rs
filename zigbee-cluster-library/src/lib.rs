@@ -64,4 +64,5 @@ pub mod lighting;
 // Chapter 6
 pub mod hvac;
 // Chapter 10
+pub mod electrical;
 pub mod energy;
