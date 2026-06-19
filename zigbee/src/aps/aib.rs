@@ -1,12 +1,13 @@
 use zigbee_macros::construct_ib;
 use zigbee_macros::impl_byte;
+use zigbee_types::BindingEntry;
 use zigbee_types::ByteArray;
 use zigbee_types::IeeeAddress;
+use zigbee_types::MAX_BINDING_TABLE_ENTRIES;
 use zigbee_types::StorageVec;
 
-const MAX_APS_BINDING_TABLE: usize = 2; // TODO
 const MAX_APS_CHANNEL_MASK_LIST: usize = 2; // TODO
-const MAX_APS_GROUP_TABLE: usize = 2; // TODO
+const MAX_APS_GROUP_TABLE: usize = 16;
 const MAX_APS_MAX_WINDOW_SIZE: usize = 2; // TODO
 const MAX_APS_DEVICE_KEY_PAIR_SET: usize = 2; // TODO
 
@@ -14,7 +15,7 @@ construct_ib! {
     /// 2.2.7.2 - AIB (APS Information Base Attributes)
     pub struct Aib {
         //apsBindingTable
-        binding_table: StorageVec<ApsBinding, MAX_APS_BINDING_TABLE>,
+        binding_table: StorageVec<BindingEntry, MAX_BINDING_TABLE_ENTRIES>,
         #[ctx = ()]
         #[ctx_write = ()]
         designated_coordinator: bool = false,
@@ -37,12 +38,6 @@ construct_ib! {
         security_timeout_period: u16 = 0x00,
         //trust_center_policues: u8, // not implemented
     }
-}
-
-// TODO
-impl_byte! {
-    #[derive(Debug, Clone)]
-    pub struct ApsBinding(u8);
 }
 
 // TODO

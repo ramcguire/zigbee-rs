@@ -84,6 +84,19 @@ impl FrameControl {
             || (self.frame_type() == FrameType::Acknowledgement && self.ack_format_flag())
     }
 
+    #[must_use]
+    pub fn set_extended_header(mut self, value: bool) -> Self {
+        self.0 = (self.0 & !mask::EXTENDED_HEADER_FLAG)
+            | ((value as u8) << offset::EXTENDED_HEADER_FLAG);
+        self
+    }
+
+    #[must_use]
+    pub fn set_ack_format_flag(mut self, value: bool) -> Self {
+        self.0 = (self.0 & !mask::ACK_FORMAT_FLAG) | ((value as u8) << offset::ACK_FORMAT_FLAG);
+        self
+    }
+
     /// Whether the destination endpoint field is present (§2.2.5.1.2).
     ///
     /// Present for unicast or broadcast delivery when data fields are included.
@@ -149,11 +162,19 @@ impl_byte! {
 }
 
 impl ExtendedFrameControl {
+    pub fn new(fragmentation: Fragmentation) -> Self {
+        Self { fragmentation }
+    }
+
     pub fn is_fragmented(&self) -> bool {
         matches!(
             self.fragmentation,
             Fragmentation::Fragmentation | Fragmentation::PartOfFragmentedTransmission
         )
+    }
+
+    pub fn fragmentation(&self) -> Fragmentation {
+        self.fragmentation
     }
 }
 
