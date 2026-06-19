@@ -236,6 +236,24 @@ impl fmt::Debug for IeeeAddress {
     }
 }
 
+/// Maximum number of APS binding table entries.
+pub const MAX_BINDING_TABLE_ENTRIES: usize = 16;
+
+impl_byte! {
+    /// One APS binding table entry.
+    ///
+    /// Maps a local (endpoint, cluster) to a remote (short_addr, endpoint) for
+    /// bound report delivery and ZDP bind requests.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BindingEntry {
+        pub src_endpoint: u8,
+        pub cluster_id: u16,
+        pub dst_short_addr: u16,
+        pub dst_endpoint: u8,
+        pub profile_id: u16,
+    }
+}
+
 pub struct MacCapabilityFlagsField(u8);
 
 /// 2.3.2.3.6 - MAC Capability Flags Field
