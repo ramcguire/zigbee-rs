@@ -29,13 +29,34 @@ pub enum Address {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TxOptions {
-    SecurityEnabled = 0x01,
-    UseNetworkKey = 0x02,
-    #[default]
-    Acknowledged,
-    FragmentationPermitted = 0x08,
-    IncludeExtendedNonce = 0x10,
+pub struct TxOptions(pub u8);
+
+impl TxOptions {
+    pub const SECURITY_ENABLED: Self = Self(0x01);
+    pub const USE_NETWORK_KEY: Self = Self(0x02);
+    pub const ACKNOWLEDGED: Self = Self(0x04);
+    pub const FRAGMENTATION_PERMITTED: Self = Self(0x08);
+    pub const INCLUDE_EXTENDED_NONCE: Self = Self(0x10);
+
+    pub const fn security_enabled(self) -> bool {
+        self.0 & Self::SECURITY_ENABLED.0 != 0
+    }
+
+    pub const fn use_network_key(self) -> bool {
+        self.0 & Self::USE_NETWORK_KEY.0 != 0
+    }
+
+    pub const fn ack_requested(self) -> bool {
+        self.0 & Self::ACKNOWLEDGED.0 != 0
+    }
+
+    pub const fn fragmentation_permitted(self) -> bool {
+        self.0 & Self::FRAGMENTATION_PERMITTED.0 != 0
+    }
+
+    pub const fn include_extended_nonce(self) -> bool {
+        self.0 & Self::INCLUDE_EXTENDED_NONCE.0 != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -50,6 +71,9 @@ impl SrcEndpoint {
         } else {
             Err(ApsError::InvalidValue)
         }
+    }
+    pub const fn value(self) -> u8 {
+        self.value
     }
 }
 

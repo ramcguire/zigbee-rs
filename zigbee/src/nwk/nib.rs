@@ -26,7 +26,7 @@ use crate::security::frame::SecurityLevel;
 impl_byte! {
     #[tag(u8)]
     /// Zigbee device type.
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     pub enum DeviceType {
         /// Zigbee coordinator
         Coordinator = 0x00,
@@ -56,6 +56,9 @@ pub mod relationship {
     /// Unauthenticated child.
     pub const UNAUTHENTICATED_CHILD: u8 = 0x05;
 }
+
+#[cfg(test)]
+pub(crate) static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// See Section 3.5.1.
 const NWKC_COORDINATOR_CAPABLE: bool = true;
@@ -184,6 +187,7 @@ construct_ib! {
         #[ctx = ()]
         #[ctx_write = ()]
         leave_request_without_rejoin_allowed: bool = true,
+        logical_channel: u8 = 0xff,
         ieee_address: IeeeAddress, // read only
         // mac_interface_table: StorageVec<MacInterface, MAX_MAC_INTERFACE_TABLE>,
     }
@@ -228,9 +232,10 @@ impl CapabilityInformation {
 }
 
 impl_byte! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct NwkNeighbor {
-        //pub extended_address: IeeeAddress,
+        /// 64-bit MAC address used for association if no short coordinator address is available.
+        pub extended_address: IeeeAddress,
         pub network_address: ShortAddress,
         pub device_type: DeviceType,
         #[ctx = ()]
@@ -414,7 +419,9 @@ mod tests {
 
     #[test]
     fn nib_default() {
-        init(NibStorage::default());
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        try_init(NibStorage::default());
+        reset();
         let nib = get_ref();
 
         assert_eq!(nib.max_broadcast_retries(), 0x03);

@@ -13,8 +13,6 @@
 //! * reception control
 //! * routing
 
-use core::slice;
-
 use byte::BytesExt;
 use byte::TryRead;
 use management::NlmeEdScanConfirm;
@@ -33,6 +31,7 @@ use management::RejoinNetwork;
 use thiserror::Error;
 use zigbee_mac::Address;
 use zigbee_mac::AssociationStatus;
+use zigbee_mac::ExtendedAddress;
 use zigbee_mac::MacShortAddress;
 use zigbee_mac::PanId;
 use zigbee_mac::mlme::MacError;
@@ -70,6 +69,8 @@ pub enum NetworkError {
     NotJoined,
     #[error("no transport key received from coordinator")]
     NoTransportKey,
+    #[error("joined network has no security material installed")]
+    MissingSecurityMaterial,
     #[error("frame parse error")]
     ParseError,
     #[error("invalid frame")]
@@ -143,7 +144,11 @@ where
         };
 
         if secure {
-            let nwk_frame = NwkFrame::Data(NwkDataFrame { header, payload });
+            let nwk_frame = NwkFrame::Data(NwkDataFrame {
+                header,
+                payload,
+                payload_offset: 0,
+            });
             let cx = SecurityContext::get();
             let len = cx.encrypt_nwk_frame_in_place(nwk_frame, &mut self.buf)?;
             Ok(len)
@@ -177,9 +182,9 @@ where
         // account that the update id will wrap back to zero."  We treat the
         // update_id as a modular counter: an id `b` is considered newer than
         // `a` when the signed difference `(b - a) as i8` is positive.
-        let mut matching = table.iter().filter(|n| {
-            n.extended_pan_id == extended_pan_id && n.permit_joining && n.potential_parent == 1
-        });
+        let mut matching = table
+            .iter()
+            .filter(|n| n.extended_pan_id == extended_pan_id);
 
         let Some(first) = matching.next() else {
             return heapless::Vec::new();
@@ -252,28 +257,35 @@ where
             .iter()
             .find(|n| n.relationship == relationship::PARENT)
             .ok_or(NetworkError::NotJoined)?;
-        let addr = Address::Short(
-            PanId(self.nib().panid()),
-            MacShortAddress(parent.network_address.0),
-        );
-        Ok(addr)
+        let pan_id = PanId(self.nib().panid());
+        if parent.network_address.0 <= 0xfff7 {
+            Ok(Address::Short(
+                pan_id,
+                MacShortAddress(parent.network_address.0),
+            ))
+        } else {
+            Ok(Address::Extended(
+                pan_id,
+                ExtendedAddress(parent.extended_address.0),
+            ))
+        }
     }
 
-    async fn poll_nwk_data_request<'a>(
+    async fn poll_nwk_data_bytes(
         &mut self,
-        buf: &'a mut [u8],
-    ) -> Result<NwkDataFrame<'a>, NetworkError> {
+        buf: &mut [u8],
+        retries: u8,
+    ) -> Result<usize, NetworkError> {
         let coord_addr = self.parent_address()?;
-        let (len, _lqi) = self.mac.poll_data(coord_addr, buf).await?;
+        for _ in 0..retries {
+            match self.mac.poll_data(coord_addr, buf).await {
+                Ok((len, _lqi)) => return Ok(len),
+                Err(MacError::NoData) => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
 
-        let cx = SecurityContext::get();
-        let nwk_frame = cx.decrypt_nwk_frame_in_place(&mut buf[..len])?;
-
-        let NwkFrame::Data(data_frame) = nwk_frame else {
-            return Err(NetworkError::InvalidFrame);
-        };
-
-        Ok(data_frame)
+        Err(NetworkError::MacError(MacError::NoData))
     }
 
     /// 3.2.2.3
@@ -289,45 +301,63 @@ where
 
         // Populate the neighbor table with mandatory fields (Table 3-63)
         // and optional discovery-time fields (Table 3-64).
-        let neighbor_table = scan_result
-            .pan_descriptor
-            .iter()
-            .filter_map(|pd| match pd.coord_address {
-                Address::Short(_pan_id, short_address) => Some(NwkNeighbor {
-                    network_address: ShortAddress(short_address.0),
-                    device_type: if short_address.0 == NWK_COORDINATOR_ADDRESS {
-                        DeviceType::Coordinator
-                    } else {
-                        DeviceType::Router
-                    },
-                    rx_on_when_idle: false,
-                    end_device_configuration: 0,
-                    relationship: relationship::NONE,
-                    transmit_failure: 0,
-                    lqi: pd.link_quality,
-                    outgoing_cost: 0,
-                    age: 0,
-                    keepalive_received: false,
-                    // Table 3-64: optional discovery-time fields
-                    extended_pan_id: pd.zigbee_beacon.extended_pan_id,
-                    logical_channel: pd.channel,
-                    depth: pd.zigbee_beacon.stack_profile.device_depth(),
-                    permit_joining: pd.superframe_spec.association_permit,
-                    // end devices cannot be parents (Table 3-64)
-                    potential_parent: u8::from(
-                        pd.zigbee_beacon.stack_profile.router_capacity()
-                            || short_address.0 == NWK_COORDINATOR_ADDRESS,
-                    ),
-                    router_capacity: pd.zigbee_beacon.stack_profile.router_capacity(),
-                    end_device_capacity: pd.zigbee_beacon.stack_profile.end_device_capacity(),
-                    update_id: pd.zigbee_beacon.update_id,
-                    pan_id: pd.coord_pan_id.0,
-                }),
-                Address::Extended(_, _) => None,
-            })
-            .collect();
+        let mut neighbor_table = self.nib().neighbor_table();
+        for pd in &scan_result.pan_descriptor {
+            let (network_address, extended_address) = match pd.coord_address {
+                Address::Short(_pan_id, short_address) => {
+                    (ShortAddress(short_address.0), IeeeAddress(0))
+                }
+                Address::Extended(_, ieee) => (ShortAddress(0xffff), IeeeAddress(ieee.0)),
+            };
+            let is_coordinator = pd.superframe_spec.pan_coordinator;
+            let neighbor = NwkNeighbor {
+                extended_address,
+                network_address,
+                device_type: if is_coordinator {
+                    DeviceType::Coordinator
+                } else {
+                    DeviceType::Router
+                },
+                rx_on_when_idle: is_coordinator || pd.zigbee_beacon.stack_profile.router_capacity(),
+                end_device_configuration: 0,
+                relationship: relationship::NONE,
+                transmit_failure: 0,
+                lqi: pd.link_quality,
+                outgoing_cost: 0,
+                age: 0,
+                keepalive_received: false,
+                // Table 3-64: optional discovery-time fields
+                extended_pan_id: pd.zigbee_beacon.extended_pan_id,
+                logical_channel: pd.channel,
+                depth: pd.zigbee_beacon.stack_profile.device_depth(),
+                permit_joining: pd.superframe_spec.association_permit,
+                // end devices cannot be parents (Table 3-64)
+                potential_parent: u8::from(
+                    pd.zigbee_beacon.stack_profile.router_capacity() || is_coordinator,
+                ),
+                router_capacity: pd.zigbee_beacon.stack_profile.router_capacity(),
+                end_device_capacity: pd.zigbee_beacon.stack_profile.end_device_capacity(),
+                update_id: pd.zigbee_beacon.update_id,
+                pan_id: pd.coord_pan_id.0,
+            };
 
-        self.nib().set_neighbor_table(StorageVec(neighbor_table));
+            if let Some(existing) = neighbor_table.iter_mut().find(|n| {
+                n.extended_pan_id == neighbor.extended_pan_id
+                    && n.pan_id == neighbor.pan_id
+                    && n.network_address == neighbor.network_address
+                    && n.extended_address == neighbor.extended_address
+            }) {
+                let relationship = existing.relationship;
+                *existing = neighbor;
+                existing.relationship = relationship;
+            } else {
+                neighbor_table
+                    .push(neighbor)
+                    .map_err(|_| NetworkError::InvalidFrame)?;
+            }
+        }
+
+        self.nib().set_neighbor_table(neighbor_table);
 
         // Build network descriptors for the confirm primitive.
         let network_descriptors = scan_result
@@ -431,7 +461,11 @@ where
             let neighbor = &table[candidate_idx];
             let channel = neighbor.logical_channel;
             let pan_id = PanId(neighbor.pan_id);
-            let dest = Address::Short(pan_id, MacShortAddress(neighbor.network_address.0));
+            let dest = if neighbor.network_address.0 <= 0xfff7 {
+                Address::Short(pan_id, MacShortAddress(neighbor.network_address.0))
+            } else {
+                Address::Extended(pan_id, ExtendedAddress(neighbor.extended_address.0))
+            };
             drop(table);
 
             // Issue MLME-ASSOCIATE.request to MAC sub-layer.
@@ -442,39 +476,29 @@ where
                             // --- Success: update NIB (§3.6.1.4.1.1) ---
                             let assigned_addr = response.association_address;
                             self.nib().set_network_address(assigned_addr.0);
-                            self.nib().set_ieee_address(response.device_address);
                             self.nib().set_extended_panid(request.extended_pan_id.0);
                             self.nib().set_panid(pan_id.0);
 
-                            // Read parent fields before the clearing loop
-                            // zeroes them (§3.6.1.4.1.1).
-                            let parent_update_id =
-                                self.nib().neighbor_table()[candidate_idx].update_id;
-                            let parent_channel =
-                                self.nib().neighbor_table()[candidate_idx].logical_channel;
+                            let parent = self.nib().neighbor_table()[candidate_idx].clone();
+                            let parent_update_id = parent.update_id;
+                            let parent_channel = parent.logical_channel;
                             self.nib().set_update_id(parent_update_id);
+                            self.nib().set_logical_channel(parent_channel);
 
-                            // Update the neighbor table: set the relationship
-                            // field to 0x00 (parent) and clear optional
-                            // Table 3-64 fields on all entries (they should
-                            // not be retained after joining).
-                            let mut table = self.nib().neighbor_table();
-                            table[candidate_idx].relationship = relationship::PARENT;
-                            for neighbor in table.iter_mut() {
-                                neighbor.extended_pan_id = IeeeAddress(0);
-                                neighbor.logical_channel = 0;
-                                neighbor.depth = 0;
-                                neighbor.permit_joining = false;
-                                neighbor.potential_parent = 0;
-                                neighbor.router_capacity = false;
-                                neighbor.end_device_capacity = false;
-                                neighbor.update_id = 0;
-                                neighbor.pan_id = 0xffff;
+                            let mut parent = parent;
+                            parent.relationship = relationship::PARENT;
+                            parent.extended_pan_id = IeeeAddress(0);
+                            parent.depth = 0;
+                            parent.permit_joining = false;
+                            parent.potential_parent = 0;
+                            parent.router_capacity = false;
+                            parent.end_device_capacity = false;
+                            parent.update_id = 0;
+
+                            let mut table = StorageVec::new();
+                            if table.push(parent).is_err() {
+                                return fail(NlmeJoinStatus::MacError);
                             }
-                            // Discard entries not on the chosen network
-                            // (they are no longer relevant).
-                            // TODO: retain only entries belonging to the
-                            // joined network.
                             self.nib().set_neighbor_table(table);
 
                             return NlmeJoinConfirm {
@@ -501,7 +525,7 @@ where
                             last_status = NlmeJoinStatus::PanAccessDenied;
                         }
                         _ => {
-                            // Other status codes (FastAssociationSuccesful,
+                            // Other status codes (FastAssociationSuccessful,
                             // HoppingSequenceOffsetDuplication, etc.) are
                             // treated as a generic MAC-level failure.
                             last_status = NlmeJoinStatus::MacError;
@@ -523,8 +547,23 @@ where
     /// (§3.2.2.13).
     #[allow(clippy::unused_async)]
     pub async fn rejoin(&mut self) -> NlmeJoinConfirm {
-        // TODO: implement NWK rejoin procedure (§3.6.1.4.2)
-        todo!()
+        NlmeJoinConfirm {
+            status: NlmeJoinStatus::InvalidRequest,
+            network_address: ShortAddress(self.nib().network_address()),
+            extended_pan_id: IeeeAddress(self.nib().extended_panid()),
+            channel: self.nib().logical_channel(),
+            enhanced_beacon_type: false,
+            mac_interface_index: 0,
+        }
+    }
+
+    pub async fn leave(&mut self) -> management::NlmeLeaveConfirm {
+        self.nib().set_network_address(0xffff);
+        self.nib().set_panid(0xffff);
+        self.nib().set_extended_panid(0);
+        self.nib().set_neighbor_table(StorageVec::new());
+        self.nib().set_security_material_set(StorageVec::new());
+        management::NlmeLeaveConfirm {}
     }
 
     /// Poll the coordinator for pending data, strip the NWK header, and
@@ -534,21 +573,15 @@ where
         buf: &'a mut [u8],
         retries: u8,
     ) -> Result<NwkDataFrame<'a>, NetworkError> {
-        for _ in 0..retries {
-            // SAFETY: `buf` is mutably borrowed once at a time
-            // need to get rid of the 'a lifetime in the loop
-            // &mut buf is still guaranteed within 'a
-            let buf = unsafe { slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) };
-            match self.poll_nwk_data_request(buf).await {
-                Ok(data_frame) => {
-                    return Ok(data_frame);
-                }
-                Err(NetworkError::MacError(MacError::NoData)) => (),
-                Err(e) => return Err(e),
-            }
-        }
+        let len = self.poll_nwk_data_bytes(buf, retries).await?;
+        let cx = SecurityContext::get();
+        let nwk_frame = cx.decrypt_nwk_frame_in_place(&mut buf[..len])?;
 
-        Err(NetworkError::MacError(MacError::NoData))
+        let NwkFrame::Data(data_frame) = nwk_frame else {
+            return Err(NetworkError::InvalidFrame);
+        };
+
+        Ok(data_frame)
     }
 
     /// Broadcast an NWK data frame (§3.6.5).
@@ -608,9 +641,6 @@ mod tests {
 
     use super::*;
     use crate::nwk::nib::NibStorage;
-
-    // tests share a global NIB singleton — serialize access
-    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // -------------------------------------------------------------------
     // Minimal async block_on — the mock futures resolve immediately so a
@@ -678,6 +708,7 @@ mod tests {
     fn make_neighbor(pan_id: u16, short_addr: u16, epid: u64, lqi: u8, depth: u8) -> NwkNeighbor {
         NwkNeighbor {
             network_address: ShortAddress(short_addr),
+            extended_address: IeeeAddress(0),
             device_type: if short_addr == 0 {
                 DeviceType::Coordinator
             } else {
@@ -704,7 +735,7 @@ mod tests {
     }
 
     fn make_nlme(mac: MockMlme) -> (std::sync::MutexGuard<'static, ()>, Nlme<MockMlme>) {
-        let guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = nib::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         use crate::nwk::nib;
         nib::try_init(NibStorage::default());
         nib::reset();
@@ -992,9 +1023,11 @@ mod tests {
         assert_eq!(confirm.status, NlmeJoinStatus::Success);
         assert_eq!(confirm.network_address.0, 0x5678);
 
+        // After join, retain keeps only the parent; the rejected candidate is
+        // discarded.
         let table = nlme.nib().neighbor_table();
-        assert_eq!(table[0].potential_parent, 0);
-        assert_eq!(table[1].relationship, 0x00);
+        assert_eq!(table.len(), 1, "only parent should remain after join");
+        assert_eq!(table[0].relationship, relationship::PARENT);
     }
 
     #[test]
@@ -1037,6 +1070,37 @@ mod tests {
 
         let confirm = block_on(nlme.join(default_join_request(0xDEAD)));
         assert_eq!(confirm.status, NlmeJoinStatus::MacError);
+    }
+
+    #[test]
+    fn join_stale_neighbors_removed_after_success() {
+        let mut mac = MockMlme::new();
+        mac.expect_associate().returning(|_, _, _| {
+            Ok(AssociationResponse {
+                device_address: IeeeAddress(0),
+                association_address: ShortAddress(0x1234),
+                status: AssociationStatus::Successful,
+            })
+        });
+
+        let (_guard, mut nlme) = make_nlme(mac);
+
+        // Two neighbors on the same network — only the chosen parent should survive.
+        let mut table = StorageVec::new();
+        table
+            .push(make_neighbor(0xAAAA, 0x0000, 0xDEAD, 200, 0))
+            .unwrap();
+        table
+            .push(make_neighbor(0xAAAA, 0x0001, 0xDEAD, 180, 1))
+            .unwrap();
+        nlme.nib().set_neighbor_table(table);
+
+        let confirm = block_on(nlme.join(default_join_request(0xDEAD)));
+        assert_eq!(confirm.status, NlmeJoinStatus::Success);
+
+        let table = nlme.nib().neighbor_table();
+        assert_eq!(table.len(), 1, "only parent should remain");
+        assert_eq!(table[0].relationship, relationship::PARENT);
     }
 
     #[test]
